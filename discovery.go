@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"strings"
 	"sync"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
@@ -22,13 +23,13 @@ func resolveBucketRegion(ctx context.Context, client *s3.Client, bucket string) 
 	return region, nil
 }
 
-func discover(ctx context.Context, client *s3.Client, bucket string, statsChan chan<- StatBatch, prog *Progress) <-chan WorkItem {
+func discover(ctx context.Context, client *s3.Client, bucket string, filesChan chan<- taggedFile, prog *Progress) <-chan WorkItem {
 	workChan := make(chan WorkItem, 256)
 
 	go func() {
 		defer close(workChan)
 
-		topPrefixes := listWithDelimiter(ctx, client, bucket, "", statsChan, prog)
+		topPrefixes := listWithDelimiter(ctx, client, bucket, "", filesChan, prog)
 
 		var wg sync.WaitGroup
 		sem := make(chan struct{}, 32)
@@ -38,7 +39,7 @@ func discover(ctx context.Context, client *s3.Client, bucket string, statsChan c
 			go func(p string) {
 				defer wg.Done()
 				defer func() { <-sem }()
-				subPrefixes := listWithDelimiter(ctx, client, bucket, p, statsChan, prog)
+				subPrefixes := listWithDelimiter(ctx, client, bucket, p, filesChan, prog)
 				for _, sub := range subPrefixes {
 					workChan <- WorkItem{Prefix: sub, Depth: 2}
 				}
@@ -50,8 +51,7 @@ func discover(ctx context.Context, client *s3.Client, bucket string, statsChan c
 	return workChan
 }
 
-// listWithDelimiter lists one level with delimiter="/", emits objects as StatBatches, returns CommonPrefixes.
-func listWithDelimiter(ctx context.Context, client *s3.Client, bucket, prefix string, statsChan chan<- StatBatch, prog *Progress) []string {
+func listWithDelimiter(ctx context.Context, client *s3.Client, bucket, prefix string, filesChan chan<- taggedFile, prog *Progress) []string {
 	var prefixes []string
 	var token *string
 
@@ -67,27 +67,22 @@ func listWithDelimiter(ctx context.Context, client *s3.Client, bucket, prefix st
 		}
 		prog.listRequests.Add(1)
 
-		// group objects by storage class into batches
-		batchMap := map[string]*StatBatch{}
 		for _, obj := range resp.Contents {
+			if obj.Key == nil {
+				continue
+			}
 			sc := string(obj.StorageClass)
 			if sc == "" {
 				sc = "STANDARD"
 			}
-			b := batchMap[sc]
-			if b == nil {
-				batchMap[sc] = &StatBatch{Prefix: prefix, StorageClass: sc}
-				b = batchMap[sc]
-			}
-			b.Count++
+			var size int64
 			if obj.Size != nil {
-				b.SizeBytes += *obj.Size
-				prog.bytesAccounted.Add(*obj.Size)
+				size = *obj.Size
 			}
+			prog.bytesAccounted.Add(size)
 			prog.objectsAccounted.Add(1)
-		}
-		for _, b := range batchMap {
-			statsChan <- *b
+			parent, name := splitKey(*obj.Key)
+			filesChan <- taggedFile{ParentPrefix: parent, FileEntry: FileEntry{Name: name, SizeBytes: size, StorageClass: sc}}
 		}
 
 		for _, cp := range resp.CommonPrefixes {
@@ -102,4 +97,14 @@ func listWithDelimiter(ctx context.Context, client *s3.Client, bucket, prefix st
 		token = resp.NextContinuationToken
 	}
 	return prefixes
+}
+
+// splitKey splits "a/b/c/file.txt" into ("a/b/c/", "file.txt").
+// Root-level keys like "readme.txt" → ("", "readme.txt").
+func splitKey(key string) (parent, name string) {
+	idx := strings.LastIndex(key, "/")
+	if idx < 0 {
+		return "", key
+	}
+	return key[:idx+1], key[idx+1:]
 }

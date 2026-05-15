@@ -8,26 +8,26 @@ import (
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 )
 
-func runWorkers(ctx context.Context, client *s3.Client, bucket string, workChan <-chan WorkItem, statsChan chan<- StatBatch, n int, prog *Progress) {
+func runWorkers(ctx context.Context, client *s3.Client, bucket string, workChan <-chan WorkItem, filesChan chan<- taggedFile, n int, prog *Progress) {
 	var wg sync.WaitGroup
 	for i := 0; i < n; i++ {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			worker(ctx, client, bucket, workChan, statsChan, prog)
+			worker(ctx, client, bucket, workChan, filesChan, prog)
 		}()
 	}
 	wg.Wait()
-	close(statsChan)
+	close(filesChan)
 }
 
-func worker(ctx context.Context, client *s3.Client, bucket string, workChan <-chan WorkItem, statsChan chan<- StatBatch, prog *Progress) {
+func worker(ctx context.Context, client *s3.Client, bucket string, workChan <-chan WorkItem, filesChan chan<- taggedFile, prog *Progress) {
 	for item := range workChan {
-		listRecursive(ctx, client, bucket, item.Prefix, statsChan, prog)
+		listRecursive(ctx, client, bucket, item.Prefix, filesChan, prog)
 	}
 }
 
-func listRecursive(ctx context.Context, client *s3.Client, bucket, prefix string, statsChan chan<- StatBatch, prog *Progress) {
+func listRecursive(ctx context.Context, client *s3.Client, bucket, prefix string, filesChan chan<- taggedFile, prog *Progress) {
 	var token *string
 	for {
 		resp, err := client.ListObjectsV2(ctx, &s3.ListObjectsV2Input{
@@ -39,29 +39,22 @@ func listRecursive(ctx context.Context, client *s3.Client, bucket, prefix string
 			break
 		}
 		prog.listRequests.Add(1)
-
-		batchMap := map[string]*StatBatch{}
 		for _, obj := range resp.Contents {
 			sc := string(obj.StorageClass)
 			if sc == "" {
 				sc = "STANDARD"
 			}
-			b := batchMap[sc]
-			if b == nil {
-				batchMap[sc] = &StatBatch{Prefix: prefix, StorageClass: sc}
-				b = batchMap[sc]
-			}
-			b.Count++
+			var size int64
 			if obj.Size != nil {
-				b.SizeBytes += *obj.Size
-				prog.bytesAccounted.Add(*obj.Size)
+				size = *obj.Size
 			}
+			prog.bytesAccounted.Add(size)
 			prog.objectsAccounted.Add(1)
+			if obj.Key != nil {
+				parent, name := splitKey(*obj.Key)
+				filesChan <- taggedFile{ParentPrefix: parent, FileEntry: FileEntry{Name: name, SizeBytes: size, StorageClass: sc}}
+			}
 		}
-		for _, b := range batchMap {
-			statsChan <- *b
-		}
-
 		if resp.IsTruncated == nil || !*resp.IsTruncated || resp.NextContinuationToken == nil {
 			break
 		}

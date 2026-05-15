@@ -9,39 +9,17 @@ type WorkItem struct {
 	Depth  int
 }
 
-type StatBatch struct {
-	Prefix       string
-	StorageClass string
-	Count        int64
+// FileEntry is a single object's data stored relative to its parent prefix.
+type FileEntry struct {
+	Name         string
 	SizeBytes    int64
-}
-
-type PrefixClassKey struct {
-	Prefix       string
 	StorageClass string
 }
 
-type PrefixStats struct {
-	Count int64
-	Size  int64
-}
-
-type AggregatedStats struct {
-	data map[PrefixClassKey]*PrefixStats
-}
-
-func newAggregatedStats() *AggregatedStats {
-	return &AggregatedStats{data: make(map[PrefixClassKey]*PrefixStats)}
-}
-
-func (a *AggregatedStats) add(batch StatBatch) {
-	key := PrefixClassKey{Prefix: batch.Prefix, StorageClass: batch.StorageClass}
-	if s, ok := a.data[key]; ok {
-		s.Count += batch.Count
-		s.Size += batch.SizeBytes
-	} else {
-		a.data[key] = &PrefixStats{Count: batch.Count, Size: batch.SizeBytes}
-	}
+// taggedFile pairs a FileEntry with its immediate parent prefix.
+type taggedFile struct {
+	ParentPrefix string
+	FileEntry
 }
 
 type Progress struct {

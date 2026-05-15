@@ -2,12 +2,12 @@ package main
 
 import (
 	"context"
+	"errors"
 	"flag"
 	"fmt"
 	"os"
 	"sort"
 	"strings"
-	"text/tabwriter"
 
 	"github.com/aws/aws-sdk-go-v2/config"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
@@ -19,8 +19,10 @@ func main() {
 	bucket := flag.String("bucket", "", "S3 bucket name (required)")
 	workers := flag.Int("workers", 32, "parallel worker count")
 	region := flag.String("region", "", "AWS region (default: from env/profile)")
+	interactive := flag.Bool("i", false, "launch interactive TUI after scan")
+	refresh := flag.Bool("refresh", false, "ignore cache and re-scan (use with -i)")
 	flag.Usage = func() {
-		fmt.Fprintf(os.Stderr, "Usage: s3du -bucket <name> [-workers N] [-region r]\n\n")
+		fmt.Fprintf(os.Stderr, "Usage: s3du -bucket <name> [-workers N] [-region r] [-i] [--refresh]\n\n")
 		flag.PrintDefaults()
 	}
 	flag.Parse()
@@ -42,8 +44,6 @@ func main() {
 		os.Exit(1)
 	}
 
-	// Probe bucket region first — bucket may live in a different region than credentials.
-	// GetBucketLocation returns empty string for us-east-1 (AWS quirk).
 	client := s3.NewFromConfig(cfg)
 	bucketRegion, err := resolveBucketRegion(ctx, client, *bucket)
 	if err != nil {
@@ -59,92 +59,136 @@ func main() {
 		client = s3.NewFromConfig(cfg)
 	}
 
+	// Try loading from cache when in interactive mode and --refresh not set.
+	if *interactive && !*refresh {
+		if cf, err := LoadStats(*bucket, bucketRegion); err == nil {
+			treeIndex, treeErr := OpenTreeIndex(*bucket, bucketRegion)
+			objIndex, objFile, objErr := OpenObjectsIndex(*bucket, bucketRegion)
+			if treeErr != nil || objErr != nil {
+				fmt.Fprintf(os.Stderr, "warning: cache incomplete (%v / %v), re-scanning\n", treeErr, objErr)
+			} else {
+				defer objFile.Close()
+				fmt.Fprintf(os.Stderr, "Loaded from cache (scanned %s, %d LIST requests)\n",
+					cf.ScannedAt.Format("2006-01-02 15:04:05"), cf.ListRequests)
+				if err := runTUI(*bucket, bucketRegion, cf.ListRequests, treeIndex, objIndex, objFile); err != nil {
+					fmt.Fprintf(os.Stderr, "TUI error: %v\n", err)
+					os.Exit(1)
+				}
+				return
+			}
+		}
+	}
+
+	// Run full scan.
 	prog := &Progress{}
-	statsChan := make(chan StatBatch, 512)
+	filesChan := make(chan taggedFile, 2048)
 
 	doneProg := make(chan struct{})
 	go runProgress(prog, bucketRegion, doneProg)
 
-	workChan := discover(ctx, client, *bucket, statsChan, prog)
+	cacheD, err := cacheDir(*bucket, bucketRegion)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "cache dir error: %v\n", err)
+		os.Exit(1)
+	}
+	walPath := cacheD + "/objects.wal"
+	objPath := objectsPath(cacheD)
+	treeP := treePath(cacheD)
 
-	aggDone := make(chan *AggregatedStats, 1)
-	go func() {
-		aggDone <- aggregator(statsChan)
-	}()
+	workChan := discover(ctx, client, *bucket, filesChan, prog)
 
-	runWorkers(ctx, client, *bucket, workChan, statsChan, *workers, prog)
+	walDone := make(chan error, 1)
+	go func() { walDone <- WriteWAL(walPath, filesChan) }()
 
-	agg := <-aggDone
+	runWorkers(ctx, client, *bucket, workChan, filesChan, *workers, prog)
+	// filesChan closed by runWorkers
+
 	close(doneProg)
 
+	if err := <-walDone; err != nil {
+		fmt.Fprintf(os.Stderr, "warning: WAL write error: %v\n", err)
+	}
+
+	if err := BuildObjectsBin(walPath, objPath); err != nil {
+		fmt.Fprintf(os.Stderr, "warning: could not build objects index: %v\n", err)
+	}
+	os.Remove(walPath)
+
+	if err := BuildTreeBin(objPath, treeP); err != nil {
+		fmt.Fprintf(os.Stderr, "warning: could not build tree index: %v\n", err)
+	}
+
 	listReqs := prog.listRequests.Load()
-	printResults(agg, listReqs, bucketRegion)
-}
 
-func printResults(agg *AggregatedStats, listRequests int64, region string) {
-	// collect unique storage classes and prefixes
-	classSet := map[string]struct{}{}
-	prefixSet := map[string]struct{}{}
-	for k := range agg.data {
-		classSet[k.StorageClass] = struct{}{}
-		prefixSet[k.Prefix] = struct{}{}
+	if _, saveErr := SaveCache(*bucket, bucketRegion, listReqs); saveErr != nil {
+		fmt.Fprintf(os.Stderr, "warning: could not save cache: %v\n", saveErr)
 	}
 
-	classes := sortedKeys(classSet)
-	prefixes := sortedKeys(prefixSet)
-
-	w := tabwriter.NewWriter(os.Stdout, 0, 0, 2, ' ', 0)
-
-	var grandCount, grandSize int64
-
-	for _, sc := range classes {
-		fmt.Fprintf(w, "\n[%s]\n", sc)
-		fmt.Fprintf(w, "  Prefix\tCount\tSize\n")
-		fmt.Fprintf(w, "  %s\t%s\t%s\n", strings.Repeat("-", 40), "-----", "--------")
-
-		var classCount, classSize int64
-		for _, p := range prefixes {
-			key := PrefixClassKey{Prefix: p, StorageClass: sc}
-			s, ok := agg.data[key]
-			if !ok {
-				continue
-			}
-			label := p
-			if label == "" {
-				label = "(root)"
-			}
-			fmt.Fprintf(w, "  %s\t%d\t%s\n", label, s.Count, humanSize(s.Size))
-			classCount += s.Count
-			classSize += s.Size
+	if *interactive {
+		treeIndex, treeErr := OpenTreeIndex(*bucket, bucketRegion)
+		objIndex, objFile, objErr := OpenObjectsIndex(*bucket, bucketRegion)
+		if treeErr != nil || objErr != nil {
+			fmt.Fprintf(os.Stderr, "warning: could not open indexes: %v / %v\n", treeErr, objErr)
+		} else {
+			defer objFile.Close()
 		}
-		fmt.Fprintf(w, "  %s\t%s\t%s\n", strings.Repeat("-", 40), "-----", "--------")
-		fmt.Fprintf(w, "  TOTAL\t%d\t%s\n", classCount, humanSize(classSize))
-		grandCount += classCount
-		grandSize += classSize
+		if err := runTUI(*bucket, bucketRegion, listReqs, treeIndex, objIndex, objFile); err != nil && !errors.Is(err, context.Canceled) {
+			fmt.Fprintf(os.Stderr, "TUI error: %v\n", err)
+			os.Exit(1)
+		}
+		return
 	}
 
-	cost := computeCost(listRequests, region)
+	treeIndex, err := OpenTreeIndex(*bucket, bucketRegion)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "error: could not open tree index: %v\n", err)
+		os.Exit(1)
+	}
+	printResults(treeIndex, listReqs, bucketRegion)
+}
+
+func printResults(treeIndex map[string]DirSection, listRequests int64, region string) {
+	root, ok := treeIndex[""]
+	if !ok {
+		fmt.Println("(no data)")
+		return
+	}
+
+	// Per-storage-class summary from root.
+	scs := make([]SCSize, len(root.SCSizes))
+	copy(scs, root.SCSizes)
+	sort.Slice(scs, func(i, j int) bool { return scs[i].SC < scs[j].SC })
+	for _, s := range scs {
+		cost := monthlyStorageCost(s.Size, s.SC, region)
+		fmt.Printf("[%s]   %d files   %s   $%.4f/month\n", s.SC, s.Count, humanSize(s.Size), cost)
+	}
+	fmt.Printf("GRAND TOTAL  %d files   %s\n\n", root.Count, humanSize(root.Size))
+
+	// Direct children of root.
+	type child struct {
+		prefix string
+		sec    DirSection
+	}
+	var children []child
+	for k, sec := range treeIndex {
+		if k == "" || strings.Count(k, "/") != 1 {
+			continue
+		}
+		children = append(children, child{k, sec})
+	}
+	sort.Slice(children, func(i, j int) bool { return children[i].sec.Size > children[j].sec.Size })
+
+	if len(children) > 0 {
+		fmt.Println("Top-level directories:")
+		for _, c := range children {
+			cost := c.sec.monthlyCost(region)
+			fmt.Printf("  %-40s  %d files   %s   $%.4f/month\n",
+				c.prefix, c.sec.Count, humanSize(c.sec.Size), cost)
+		}
+		fmt.Println()
+	}
+
 	pricePerK := listCostForRegion(region)
-	fmt.Fprintf(w, "\n[GRAND TOTAL]\n")
-	fmt.Fprintf(w, "  Objects: %d\tSize: %s\n", grandCount, humanSize(grandSize))
-	fmt.Fprintf(w, "\n[COST — %s]\n", region)
-	fmt.Fprintf(w, "  LIST requests: %d\t@ $%.4f/1k\t= $%.6f\n", listRequests, pricePerK, cost)
-	w.Flush()
-}
-
-func sortedKeys(m map[string]struct{}) []string {
-	keys := make([]string, 0, len(m))
-	for k := range m {
-		keys = append(keys, k)
-	}
-	sort.Strings(keys)
-	return keys
-}
-
-func aggregator(statsChan <-chan StatBatch) *AggregatedStats {
-	agg := newAggregatedStats()
-	for batch := range statsChan {
-		agg.add(batch)
-	}
-	return agg
+	listCost := computeCost(listRequests, region)
+	fmt.Printf("LIST run: %d requests @ $%.4f/1k = $%.6f\n", listRequests, pricePerK, listCost)
 }
