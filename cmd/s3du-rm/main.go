@@ -52,10 +52,19 @@ type opts struct {
 }
 
 type stats struct {
-	listed   atomic.Int64
-	deleted  atomic.Int64
-	errored  atomic.Int64
-	requests atomic.Int64
+	listed       atomic.Int64
+	listedBytes  atomic.Int64
+	deleted      atomic.Int64
+	deletedBytes atomic.Int64
+	errored      atomic.Int64
+	requests     atomic.Int64
+}
+
+// objRef carries the key plus its size through the pipeline so the delete
+// stage can report bytes freed.
+type objRef struct {
+	key  *string
+	size int64
 }
 
 func main() {
@@ -241,8 +250,8 @@ func confirmStdin(bucket, prefix string) error {
 
 func runPipeline(ctx context.Context, c *s3.Client, o opts, seeds []string) error {
 	prefixCh := make(chan string, o.listWorkers*4)
-	keyCh := make(chan types.ObjectIdentifier, 10_000)
-	batchCh := make(chan []types.ObjectIdentifier, o.deleteWorkers*2)
+	keyCh := make(chan objRef, 10_000)
+	batchCh := make(chan []objRef, o.deleteWorkers*2)
 
 	var st stats
 	start := time.Now()
@@ -279,12 +288,12 @@ func runPipeline(ctx context.Context, c *s3.Client, o opts, seeds []string) erro
 	var wgBatch sync.WaitGroup
 	wgBatch.Go(func() {
 		defer close(batchCh)
-		buf := make([]types.ObjectIdentifier, 0, deleteBatchSize)
+		buf := make([]objRef, 0, deleteBatchSize)
 		flush := func() {
 			if len(buf) == 0 {
 				return
 			}
-			b := make([]types.ObjectIdentifier, len(buf))
+			b := make([]objRef, len(buf))
 			copy(b, buf)
 			select {
 			case <-ctx.Done():
@@ -307,14 +316,21 @@ func runPipeline(ctx context.Context, c *s3.Client, o opts, seeds []string) erro
 		wgDel.Go(func() {
 			for batch := range batchCh {
 				st.requests.Add(1)
+				ids := make([]types.ObjectIdentifier, len(batch))
+				batchBytes := int64(0)
+				for i, r := range batch {
+					ids[i] = types.ObjectIdentifier{Key: r.key}
+					batchBytes += r.size
+				}
 				if !o.yes {
 					st.deleted.Add(int64(len(batch)))
+					st.deletedBytes.Add(batchBytes)
 					continue
 				}
 				out, err := c.DeleteObjects(ctx, &s3.DeleteObjectsInput{
 					Bucket: aws.String(o.bucket),
 					Delete: &types.Delete{
-						Objects: batch,
+						Objects: ids,
 						Quiet:   aws.Bool(true),
 					},
 				})
@@ -327,13 +343,22 @@ func runPipeline(ctx context.Context, c *s3.Client, o opts, seeds []string) erro
 					continue
 				}
 				ok := int64(len(batch))
-				for _, e := range out.Errors {
-					log.Printf("delete err key=%q code=%q msg=%q",
-						aws.ToString(e.Key), aws.ToString(e.Code), aws.ToString(e.Message))
-					st.errored.Add(1)
-					ok--
+				okBytes := batchBytes
+				if len(out.Errors) > 0 {
+					sizeByKey := make(map[string]int64, len(batch))
+					for _, r := range batch {
+						sizeByKey[aws.ToString(r.key)] = r.size
+					}
+					for _, e := range out.Errors {
+						log.Printf("delete err key=%q code=%q msg=%q",
+							aws.ToString(e.Key), aws.ToString(e.Code), aws.ToString(e.Message))
+						st.errored.Add(1)
+						ok--
+						okBytes -= sizeByKey[aws.ToString(e.Key)]
+					}
 				}
 				st.deleted.Add(ok)
+				st.deletedBytes.Add(okBytes)
 			}
 		})
 	}
@@ -356,8 +381,10 @@ func runPipeline(ctx context.Context, c *s3.Client, o opts, seeds []string) erro
 		fmt.Fprintln(os.Stderr)
 	}
 	fmt.Fprintf(os.Stderr,
-		"final: listed=%d deleted=%d errored=%d requests=%d dry_run=%v elapsed=%s\n",
-		st.listed.Load(), st.deleted.Load(), st.errored.Load(), st.requests.Load(),
+		"final: listed=%d (%s) deleted=%d (%s) errored=%d requests=%d dry_run=%v elapsed=%s\n",
+		st.listed.Load(), humanBytes(st.listedBytes.Load()),
+		st.deleted.Load(), humanBytes(st.deletedBytes.Load()),
+		st.errored.Load(), st.requests.Load(),
 		!o.yes, time.Since(start).Round(time.Millisecond),
 	)
 	if err := ctx.Err(); err != nil && !errors.Is(err, context.Canceled) {
@@ -367,7 +394,7 @@ func runPipeline(ctx context.Context, c *s3.Client, o opts, seeds []string) erro
 }
 
 func listRecursive(ctx context.Context, c *s3.Client, bucket, prefix string,
-	out chan<- types.ObjectIdentifier, st *stats) error {
+	out chan<- objRef, st *stats) error {
 	p := s3.NewListObjectsV2Paginator(c, &s3.ListObjectsV2Input{
 		Bucket: aws.String(bucket),
 		Prefix: aws.String(prefix),
@@ -382,11 +409,13 @@ func listRecursive(ctx context.Context, c *s3.Client, bucket, prefix string,
 			if obj.Key == nil {
 				continue
 			}
+			size := aws.ToInt64(obj.Size)
 			st.listed.Add(1)
+			st.listedBytes.Add(size)
 			select {
 			case <-ctx.Done():
 				return ctx.Err()
-			case out <- types.ObjectIdentifier{Key: obj.Key}:
+			case out <- objRef{key: obj.Key, size: size}:
 			}
 		}
 	}
@@ -396,7 +425,7 @@ func listRecursive(ctx context.Context, c *s3.Client, bucket, prefix string,
 func progress(ctx context.Context, st *stats, start time.Time, stop <-chan struct{}) {
 	t := time.NewTicker(500 * time.Millisecond)
 	defer t.Stop()
-	var prevDel int64
+	var prevDel, prevBytes int64
 	prevTime := start
 	for {
 		select {
@@ -406,16 +435,36 @@ func progress(ctx context.Context, st *stats, start time.Time, stop <-chan struc
 			return
 		case now := <-t.C:
 			d := st.deleted.Load()
+			dBytes := st.deletedBytes.Load()
 			rate := 0.0
+			byteRate := 0.0
 			if dt := now.Sub(prevTime).Seconds(); dt > 0 {
 				rate = float64(d-prevDel) / dt
+				byteRate = float64(dBytes-prevBytes) / dt
 			}
-			prevDel, prevTime = d, now
+			prevDel, prevBytes, prevTime = d, dBytes, now
 			fmt.Fprintf(os.Stderr,
-				"\rlisted=%d deleted=%d errored=%d req=%d rate=%.0f/s elapsed=%s   ",
-				st.listed.Load(), d, st.errored.Load(), st.requests.Load(),
-				rate, time.Since(start).Round(time.Second),
+				"\rlisted=%d (%s) deleted=%d (%s) errored=%d req=%d rate=%.0f/s %s/s elapsed=%s   ",
+				st.listed.Load(), humanBytes(st.listedBytes.Load()),
+				d, humanBytes(dBytes),
+				st.errored.Load(), st.requests.Load(),
+				rate, humanBytes(int64(byteRate)),
+				time.Since(start).Round(time.Second),
 			)
 		}
 	}
+}
+
+// humanBytes formats a byte count using IEC binary units (KiB, MiB, ...).
+func humanBytes(n int64) string {
+	const unit = 1024
+	if n < unit {
+		return fmt.Sprintf("%d B", n)
+	}
+	div, exp := int64(unit), 0
+	for x := n / unit; x >= unit; x /= unit {
+		div *= unit
+		exp++
+	}
+	return fmt.Sprintf("%.1f %ciB", float64(n)/float64(div), "KMGTPE"[exp])
 }
