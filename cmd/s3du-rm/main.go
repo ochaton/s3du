@@ -11,6 +11,11 @@
 //     only insert delete markers, not free storage). Suspended is fine.
 //   - Defaults to dry-run; real deletion requires -yes plus a stdin
 //     confirmation of "<bucket>/<prefix>".
+//
+// Throttling:
+//   - SDK is configured with adaptive retry and a high MaxAttempts so that
+//     S3 SlowDown (503) responses are absorbed transparently. Batches that
+//     still fail after the retryer exhausts are counted as `throttled`.
 package main
 
 import (
@@ -19,6 +24,7 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"io"
 	"log"
 	"os"
 	"os/signal"
@@ -29,13 +35,44 @@ import (
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
+	"github.com/aws/aws-sdk-go-v2/aws/retry"
 	"github.com/aws/aws-sdk-go-v2/config"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/aws/aws-sdk-go-v2/service/s3/types"
+	"github.com/aws/smithy-go"
 )
 
-// deleteBatchSize is the DeleteObjects API hard cap.
-const deleteBatchSize = 1000
+const (
+	// deleteBatchSize is the DeleteObjects API hard cap.
+	deleteBatchSize = 1000
+	// seedPreviewLimit caps how many seed prefixes we print at startup.
+	seedPreviewLimit = 10
+	// keyChanBuffer sizes the key channel. Large enough to absorb a few
+	// pages from each list worker so listing doesn't stall on bursty deletes.
+	keyChanBuffer = 10_000
+	// retryMaxAttempts bumps the SDK retryer well above its default of 3
+	// because S3 throttles (SlowDown 503) need many attempts under bulk load.
+	retryMaxAttempts = 20
+	// retryMaxBackoff caps exponential backoff so a single throttled call
+	// cannot wedge a delete worker for minutes.
+	retryMaxBackoff = 30 * time.Second
+)
+
+// syncWriter serializes Write calls so progress redraws and log lines do
+// not interleave byte streams on stderr. log.Logger and fmt.Fprintf both
+// issue one Write per message, so a per-Write mutex is sufficient.
+type syncWriter struct {
+	mu sync.Mutex
+	w  io.Writer
+}
+
+func (s *syncWriter) Write(p []byte) (int, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.w.Write(p)
+}
+
+var stderr = &syncWriter{w: os.Stderr}
 
 type opts struct {
 	bucket        string
@@ -56,8 +93,16 @@ type stats struct {
 	listedBytes  atomic.Int64
 	deleted      atomic.Int64
 	deletedBytes atomic.Int64
-	errored      atomic.Int64
-	requests     atomic.Int64
+	// listErrors counts failed ListObjectsV2 calls (one per failed prefix
+	// attempt). Distinct from deleteErrors so the per-object delete count
+	// stays meaningful.
+	listErrors   atomic.Int64
+	deleteErrors atomic.Int64
+	// throttled counts batches that still failed with SlowDown after the
+	// SDK retryer exhausted all attempts. Signals oversubscribed worker
+	// count for the bucket.
+	throttled atomic.Int64
+	requests  atomic.Int64
 }
 
 // objRef carries the key plus its size through the pipeline so the delete
@@ -70,6 +115,7 @@ type objRef struct {
 func main() {
 	log.SetFlags(0)
 	log.SetPrefix("s3du-rm: ")
+	log.SetOutput(stderr)
 
 	var o opts
 	flag.StringVar(&o.bucket, "bucket", "", "S3 bucket (required)")
@@ -116,17 +162,17 @@ func run(o opts) error {
 		return errors.New("no prefixes resolved from seed; nothing to do")
 	}
 
-	fmt.Fprintf(os.Stderr,
-		"bucket=%s prefix=%q seed_prefixes=%d list_workers=%d delete_workers=%d batch=%d real_delete=%v\n",
-		o.bucket, o.prefix, len(seeds), o.listWorkers, o.deleteWorkers, deleteBatchSize, o.yes)
-	if len(seeds) <= 10 {
+	fmt.Fprintf(stderr,
+		"bucket=%s prefix=%q seed_prefixes=%d list_workers=%d delete_workers=%d batch=%d dry_run=%v\n",
+		o.bucket, o.prefix, len(seeds), o.listWorkers, o.deleteWorkers, deleteBatchSize, !o.yes)
+	if len(seeds) <= seedPreviewLimit {
 		for _, s := range seeds {
-			fmt.Fprintf(os.Stderr, "  seed: %s\n", s)
+			fmt.Fprintf(stderr, "  seed: %s\n", s)
 		}
 	}
 
 	if !o.yes {
-		fmt.Fprintln(os.Stderr, "DRY-RUN: nothing will be deleted (pass -yes to delete)")
+		fmt.Fprintln(stderr, "DRY-RUN: nothing will be deleted (pass -yes to delete)")
 	} else if !o.force {
 		if err := confirmStdin(o.bucket, o.prefix); err != nil {
 			return err
@@ -142,8 +188,10 @@ func validate(o opts) error {
 		return errors.New("-bucket required")
 	case strings.TrimSpace(o.prefix) == "":
 		return errors.New("-prefix required and must be non-empty (refusing whole-bucket delete)")
-	case o.listWorkers < 1, o.deleteWorkers < 1:
-		return errors.New("worker counts must be >= 1")
+	case o.listWorkers < 1:
+		return errors.New("-list-workers must be >= 1")
+	case o.deleteWorkers < 1:
+		return errors.New("-delete-workers must be >= 1")
 	case o.fanoutDepth < 1:
 		return errors.New("-fanout-depth must be >= 1")
 	case o.fanoutMin < 1:
@@ -153,7 +201,17 @@ func validate(o opts) error {
 }
 
 func newS3Client(ctx context.Context, region, endpoint string) (*s3.Client, error) {
-	var loaders []func(*config.LoadOptions) error
+	loaders := []func(*config.LoadOptions) error{
+		config.WithRetryer(func() aws.Retryer {
+			return retry.NewAdaptiveMode(func(o *retry.AdaptiveModeOptions) {
+				o.StandardOptions = append(o.StandardOptions,
+					func(so *retry.StandardOptions) {
+						so.MaxAttempts = retryMaxAttempts
+						so.MaxBackoff = retryMaxBackoff
+					})
+			})
+		}),
+	}
 	if region != "" {
 		loaders = append(loaders, config.WithRegion(region))
 	}
@@ -237,7 +295,7 @@ func listCommonPrefixes(ctx context.Context, c *s3.Client, bucket, prefix string
 
 func confirmStdin(bucket, prefix string) error {
 	want := bucket + "/" + prefix
-	fmt.Fprintf(os.Stderr, "type exactly %q to confirm deletion: ", want)
+	fmt.Fprintf(stderr, "type exactly %q to confirm deletion: ", want)
 	line, err := bufio.NewReader(os.Stdin).ReadString('\n')
 	if err != nil {
 		return fmt.Errorf("read confirmation: %w", err)
@@ -250,14 +308,14 @@ func confirmStdin(bucket, prefix string) error {
 
 func runPipeline(ctx context.Context, c *s3.Client, o opts, seeds []string) error {
 	prefixCh := make(chan string, o.listWorkers*4)
-	keyCh := make(chan objRef, 10_000)
+	keyCh := make(chan objRef, keyChanBuffer)
 	batchCh := make(chan []objRef, o.deleteWorkers*2)
 
 	var st stats
 	start := time.Now()
 
-	// seed feeder
-	go func() {
+	var wgSeed sync.WaitGroup
+	wgSeed.Go(func() {
 		defer close(prefixCh)
 		for _, p := range seeds {
 			select {
@@ -266,9 +324,8 @@ func runPipeline(ctx context.Context, c *s3.Client, o opts, seeds []string) erro
 			case prefixCh <- p:
 			}
 		}
-	}()
+	})
 
-	// list workers
 	var wgList sync.WaitGroup
 	for id := range o.listWorkers {
 		wgList.Go(func() {
@@ -278,13 +335,12 @@ func runPipeline(ctx context.Context, c *s3.Client, o opts, seeds []string) erro
 						return
 					}
 					log.Printf("list worker %d prefix=%q: %v", id, p, err)
-					st.errored.Add(1)
+					st.listErrors.Add(1)
 				}
 			}
 		})
 	}
 
-	// batcher: pack keys into ≤deleteBatchSize chunks
 	var wgBatch sync.WaitGroup
 	wgBatch.Go(func() {
 		defer close(batchCh)
@@ -301,8 +357,8 @@ func runPipeline(ctx context.Context, c *s3.Client, o opts, seeds []string) erro
 			}
 			buf = buf[:0]
 		}
-		for k := range keyCh {
-			buf = append(buf, k)
+		for r := range keyCh {
+			buf = append(buf, r)
 			if len(buf) >= deleteBatchSize {
 				flush()
 			}
@@ -310,66 +366,18 @@ func runPipeline(ctx context.Context, c *s3.Client, o opts, seeds []string) erro
 		flush()
 	})
 
-	// delete workers
 	var wgDel sync.WaitGroup
 	for id := range o.deleteWorkers {
-		wgDel.Go(func() {
-			for batch := range batchCh {
-				st.requests.Add(1)
-				ids := make([]types.ObjectIdentifier, len(batch))
-				batchBytes := int64(0)
-				for i, r := range batch {
-					ids[i] = types.ObjectIdentifier{Key: r.key}
-					batchBytes += r.size
-				}
-				if !o.yes {
-					st.deleted.Add(int64(len(batch)))
-					st.deletedBytes.Add(batchBytes)
-					continue
-				}
-				out, err := c.DeleteObjects(ctx, &s3.DeleteObjectsInput{
-					Bucket: aws.String(o.bucket),
-					Delete: &types.Delete{
-						Objects: ids,
-						Quiet:   aws.Bool(true),
-					},
-				})
-				if err != nil {
-					if ctx.Err() != nil {
-						return
-					}
-					log.Printf("delete worker %d: %v", id, err)
-					st.errored.Add(int64(len(batch)))
-					continue
-				}
-				ok := int64(len(batch))
-				okBytes := batchBytes
-				if len(out.Errors) > 0 {
-					sizeByKey := make(map[string]int64, len(batch))
-					for _, r := range batch {
-						sizeByKey[aws.ToString(r.key)] = r.size
-					}
-					for _, e := range out.Errors {
-						log.Printf("delete err key=%q code=%q msg=%q",
-							aws.ToString(e.Key), aws.ToString(e.Code), aws.ToString(e.Message))
-						st.errored.Add(1)
-						ok--
-						okBytes -= sizeByKey[aws.ToString(e.Key)]
-					}
-				}
-				st.deleted.Add(ok)
-				st.deletedBytes.Add(okBytes)
-			}
-		})
+		wgDel.Go(func() { deleteWorker(ctx, c, o, id, batchCh, &st) })
 	}
 
-	// progress
 	var wgProgress sync.WaitGroup
 	stopProgress := make(chan struct{})
 	if !o.quiet {
 		wgProgress.Go(func() { progress(ctx, &st, start, stopProgress) })
 	}
 
+	wgSeed.Wait()
 	wgList.Wait()
 	close(keyCh)
 	wgBatch.Wait()
@@ -378,19 +386,83 @@ func runPipeline(ctx context.Context, c *s3.Client, o opts, seeds []string) erro
 	wgProgress.Wait()
 
 	if !o.quiet {
-		fmt.Fprintln(os.Stderr)
+		fmt.Fprintln(stderr)
 	}
-	fmt.Fprintf(os.Stderr,
-		"final: listed=%d (%s) deleted=%d (%s) errored=%d requests=%d dry_run=%v elapsed=%s\n",
+	fmt.Fprintf(stderr,
+		"final: listed=%d (%s) deleted=%d (%s) list_errors=%d delete_errors=%d throttled=%d requests=%d dry_run=%v elapsed=%s\n",
 		st.listed.Load(), humanBytes(st.listedBytes.Load()),
 		st.deleted.Load(), humanBytes(st.deletedBytes.Load()),
-		st.errored.Load(), st.requests.Load(),
-		!o.yes, time.Since(start).Round(time.Millisecond),
+		st.listErrors.Load(), st.deleteErrors.Load(), st.throttled.Load(),
+		st.requests.Load(), !o.yes, time.Since(start).Round(time.Millisecond),
 	)
-	if err := ctx.Err(); err != nil && !errors.Is(err, context.Canceled) {
-		return err
-	}
 	return nil
+}
+
+func deleteWorker(ctx context.Context, c *s3.Client, o opts, id int,
+	batchCh <-chan []objRef, st *stats) {
+	for batch := range batchCh {
+		st.requests.Add(1)
+		ids := make([]types.ObjectIdentifier, len(batch))
+		batchBytes := int64(0)
+		for i, r := range batch {
+			ids[i] = types.ObjectIdentifier{Key: r.key}
+			batchBytes += r.size
+		}
+		if !o.yes {
+			st.deleted.Add(int64(len(batch)))
+			st.deletedBytes.Add(batchBytes)
+			continue
+		}
+		out, err := c.DeleteObjects(ctx, &s3.DeleteObjectsInput{
+			Bucket: aws.String(o.bucket),
+			Delete: &types.Delete{
+				Objects: ids,
+				Quiet:   aws.Bool(true),
+			},
+		})
+		if err != nil {
+			if ctx.Err() != nil {
+				return
+			}
+			if isThrottle(err) {
+				st.throttled.Add(1)
+			}
+			log.Printf("delete worker %d: %v", id, err)
+			st.deleteErrors.Add(int64(len(batch)))
+			continue
+		}
+		ok := int64(len(batch))
+		okBytes := batchBytes
+		if len(out.Errors) > 0 {
+			sizeByKey := make(map[string]int64, len(batch))
+			for _, r := range batch {
+				sizeByKey[aws.ToString(r.key)] = r.size
+			}
+			for _, e := range out.Errors {
+				log.Printf("delete err key=%q code=%q msg=%q",
+					aws.ToString(e.Key), aws.ToString(e.Code), aws.ToString(e.Message))
+				st.deleteErrors.Add(1)
+				ok--
+				okBytes -= sizeByKey[aws.ToString(e.Key)]
+			}
+		}
+		st.deleted.Add(ok)
+		st.deletedBytes.Add(okBytes)
+	}
+}
+
+// isThrottle reports whether err is an S3 throttle/SlowDown response that
+// the SDK could not absorb via its retryer. Used only for accounting.
+func isThrottle(err error) bool {
+	apiErr, ok := errors.AsType[smithy.APIError](err)
+	if !ok {
+		return false
+	}
+	switch apiErr.ErrorCode() {
+	case "SlowDown", "Throttling", "ThrottlingException", "RequestLimitExceeded":
+		return true
+	}
+	return false
 }
 
 func listRecursive(ctx context.Context, c *s3.Client, bucket, prefix string,
@@ -436,18 +508,18 @@ func progress(ctx context.Context, st *stats, start time.Time, stop <-chan struc
 		case now := <-t.C:
 			d := st.deleted.Load()
 			dBytes := st.deletedBytes.Load()
-			rate := 0.0
-			byteRate := 0.0
+			rate, byteRate := 0.0, 0.0
 			if dt := now.Sub(prevTime).Seconds(); dt > 0 {
 				rate = float64(d-prevDel) / dt
 				byteRate = float64(dBytes-prevBytes) / dt
 			}
 			prevDel, prevBytes, prevTime = d, dBytes, now
-			fmt.Fprintf(os.Stderr,
-				"\rlisted=%d (%s) deleted=%d (%s) errored=%d req=%d rate=%.0f/s %s/s elapsed=%s   ",
+			fmt.Fprintf(stderr,
+				"\rlisted=%d (%s) deleted=%d (%s) err=%d/%d thr=%d req=%d rate=%.0f/s %s/s elapsed=%s   ",
 				st.listed.Load(), humanBytes(st.listedBytes.Load()),
 				d, humanBytes(dBytes),
-				st.errored.Load(), st.requests.Load(),
+				st.listErrors.Load(), st.deleteErrors.Load(), st.throttled.Load(),
+				st.requests.Load(),
 				rate, humanBytes(int64(byteRate)),
 				time.Since(start).Round(time.Second),
 			)
@@ -458,13 +530,14 @@ func progress(ctx context.Context, st *stats, start time.Time, stop <-chan struc
 // humanBytes formats a byte count using IEC binary units (KiB, MiB, ...).
 func humanBytes(n int64) string {
 	const unit = 1024
+	const suffixes = "KMGTPE"
 	if n < unit {
 		return fmt.Sprintf("%d B", n)
 	}
 	div, exp := int64(unit), 0
-	for x := n / unit; x >= unit; x /= unit {
+	for x := n / unit; x >= unit && exp < len(suffixes)-1; x /= unit {
 		div *= unit
 		exp++
 	}
-	return fmt.Sprintf("%.1f %ciB", float64(n)/float64(div), "KMGTPE"[exp])
+	return fmt.Sprintf("%.1f %ciB", float64(n)/float64(div), suffixes[exp])
 }
