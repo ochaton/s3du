@@ -7,7 +7,8 @@
 //
 // Safety:
 //   - -prefix is required and must be non-empty (no whole-bucket rm).
-//   - Refuses to run if bucket versioning is Enabled or Suspended.
+//   - Refuses to run if bucket versioning is Enabled (DeleteObject would
+//     only insert delete markers, not free storage). Suspended is fine.
 //   - Defaults to dry-run; real deletion requires -yes plus a stdin
 //     confirmation of "<bucket>/<prefix>".
 package main
@@ -159,9 +160,10 @@ func newS3Client(ctx context.Context, region, endpoint string) (*s3.Client, erro
 	}), nil
 }
 
-// guardVersioning aborts unless the bucket has never had versioning enabled.
-// Suspended buckets still retain old versions and produce delete-markers on
-// delete, which this tool is not designed to handle.
+// guardVersioning aborts only when versioning is Enabled. In that state
+// DeleteObject inserts a delete marker instead of actually removing data,
+// so storage would not be freed. Suspended buckets behave like unversioned
+// ones for new deletes (replace the "null" version), which is acceptable.
 func guardVersioning(ctx context.Context, c *s3.Client, bucket string) error {
 	out, err := c.GetBucketVersioning(ctx, &s3.GetBucketVersioningInput{
 		Bucket: aws.String(bucket),
@@ -169,9 +171,8 @@ func guardVersioning(ctx context.Context, c *s3.Client, bucket string) error {
 	if err != nil {
 		return fmt.Errorf("GetBucketVersioning: %w", err)
 	}
-	switch out.Status {
-	case types.BucketVersioningStatusEnabled, types.BucketVersioningStatusSuspended:
-		return fmt.Errorf("bucket versioning is %q; refusing to delete (this tool only deletes current versions)", out.Status)
+	if out.Status == types.BucketVersioningStatusEnabled {
+		return errors.New("bucket versioning is Enabled; refusing to delete (DeleteObject would only insert delete markers, not free storage)")
 	}
 	return nil
 }
