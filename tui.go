@@ -1,7 +1,9 @@
 package main
 
 import (
+	"cmp"
 	"fmt"
+	"slices"
 	"strings"
 
 	tea "github.com/charmbracelet/bubbletea"
@@ -55,15 +57,8 @@ func (m *tuiModel) reload() {
 	m.err = nil
 	m.entries = entries
 	if m.cursor >= len(entries) {
-		m.cursor = max0(len(entries) - 1)
+		m.cursor = max(0, len(entries)-1)
 	}
-}
-
-func max0(n int) int {
-	if n < 0 {
-		return 0
-	}
-	return n
 }
 
 func (m *tuiModel) Init() tea.Cmd { return nil }
@@ -88,13 +83,13 @@ func (m *tuiModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		case "home", "g":
 			m.cursor = 0
 		case "end", "G":
-			m.cursor = max0(len(m.entries) - 1)
+			m.cursor = max(0, len(m.entries) - 1)
 		case "pgup":
-			m.cursor = max0(m.cursor - m.pageStep())
+			m.cursor = max(0, m.cursor - m.pageStep())
 		case "pgdown":
 			m.cursor = m.cursor + m.pageStep()
 			if m.cursor >= len(m.entries) {
-				m.cursor = max0(len(m.entries) - 1)
+				m.cursor = max(0, len(m.entries) - 1)
 			}
 		case "enter", "right", "l":
 			m.descend()
@@ -331,11 +326,7 @@ func classBreakdown(entries []radix.Entry) string {
 	for c := range totals {
 		classes = append(classes, c)
 	}
-	for i := 1; i < len(classes); i++ {
-		for j := i; j > 0 && classes[j-1] > classes[j]; j-- {
-			classes[j-1], classes[j] = classes[j], classes[j-1]
-		}
-	}
+	slices.SortFunc(classes, func(a, b radix.StorageClass) int { return cmp.Compare(a, b) })
 	parts := make([]string, 0, len(classes))
 	for _, c := range classes {
 		t := totals[c]

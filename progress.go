@@ -42,8 +42,10 @@ func (p *Progress) observeList() { p.listRequests.Add(1) }
 func (p *Progress) observeBatch(objs []radix.Object) {
 	p.objectsSeen.Add(int64(len(objs)))
 	for i := range objs {
+		// Class is uint8, so 0 <= class always; clamp only the high end
+		// (defensive: a future radix release may grow the enum past 16).
 		class := int(objs[i].Class)
-		if class < 0 || class >= numStorageClasses {
+		if class >= numStorageClasses {
 			class = int(radix.ClassUnknown)
 		}
 		p.bytesByClass[class].Add(objs[i].Size)
@@ -103,18 +105,6 @@ func (s ProgressSnapshot) TotalBytes() int64 {
 		t += s.BytesByClass[i]
 	}
 	return t
-}
-
-// NonZeroClasses lists the storage classes with at least one observed
-// object, in StorageClass enum order.
-func (s ProgressSnapshot) NonZeroClasses() []radix.StorageClass {
-	out := make([]radix.StorageClass, 0, 4)
-	for i := range numStorageClasses {
-		if s.ObjectsByClass[i] > 0 {
-			out = append(out, radix.StorageClass(i))
-		}
-	}
-	return out
 }
 
 // RunReporter prints a one-line progress summary to w every interval until

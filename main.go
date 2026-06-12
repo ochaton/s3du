@@ -8,10 +8,10 @@ import (
 	"errors"
 	"flag"
 	"fmt"
-	"log"
 	"os"
 	"os/signal"
 	"path/filepath"
+	"sync"
 	"syscall"
 	"time"
 
@@ -28,94 +28,118 @@ const (
 	retryMaxBackoff  = 30 * time.Second
 )
 
-func main() {
-	var (
-		bucket        = flag.String("bucket", "", "S3 bucket to scan (required unless -load is set)")
-		region        = flag.String("region", "", "AWS region (auto-detected when empty)")
-		endpoint      = flag.String("endpoint", "", "non-AWS S3 endpoint URL (uses path-style addressing)")
-		workers       = flag.Int("workers", 32, "number of concurrent ListObjectsV2 workers")
-		parallelDepth = flag.Int("parallel-depth", 3, "delimiter-walk depth at which prefixes become parallel work units")
-		snapshotPath  = flag.String("snapshot", "", "path to write/read the binary tree snapshot (defaults to ~/.cache/s3du/<bucket>@<region>/tree.snap)")
-		loadOnly      = flag.Bool("load", false, "skip scanning, load the snapshot from -snapshot and continue (e.g., launch TUI)")
-		interactive   = flag.Bool("i", false, "launch the bubbletea TUI after the scan finishes")
-		progressMs    = flag.Int("progress-ms", 250, "progress reporter interval in milliseconds")
-	)
-	flag.Parse()
+type opts struct {
+	bucket        string
+	region        string
+	endpoint      string
+	workers       int
+	parallelDepth int
+	snapshotPath  string
+	loadOnly      bool
+	interactive   bool
+	progressEvery time.Duration
+}
 
-	if err := run(*bucket, *region, *endpoint, *workers, *parallelDepth, *snapshotPath, *loadOnly, *interactive, *progressMs); err != nil {
+func main() {
+	var o opts
+	progressMs := flag.Int("progress-ms", 250, "progress reporter interval in milliseconds")
+	flag.StringVar(&o.bucket, "bucket", "", "S3 bucket to scan (required unless -load is set)")
+	flag.StringVar(&o.region, "region", "", "AWS region (auto-detected when empty)")
+	flag.StringVar(&o.endpoint, "endpoint", "", "non-AWS S3 endpoint URL (uses path-style addressing)")
+	flag.IntVar(&o.workers, "workers", 32, "number of concurrent ListObjectsV2 workers")
+	flag.IntVar(&o.parallelDepth, "parallel-depth", 3, "delimiter-walk depth at which prefixes become parallel work units")
+	flag.StringVar(&o.snapshotPath, "snapshot", "", "path to write/read the binary tree snapshot (defaults to ~/.cache/s3du/<bucket>@<region>/tree.snap)")
+	flag.BoolVar(&o.loadOnly, "load", false, "skip scanning, load the snapshot from -snapshot and continue (e.g., launch TUI)")
+	flag.BoolVar(&o.interactive, "i", false, "launch the bubbletea TUI after the scan finishes")
+	flag.Parse()
+	o.progressEvery = time.Duration(*progressMs) * time.Millisecond
+
+	if err := run(o); err != nil {
 		fmt.Fprintln(os.Stderr, "s3du:", err)
 		os.Exit(1)
 	}
 }
 
-func run(bucket, region, endpoint string, workers, parallelDepth int, snapshotPath string, loadOnly, interactive bool, progressMs int) error {
+func run(o opts) error {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
 	// Resolve snapshot path early; both paths (scan + load) need it.
-	if snapshotPath == "" {
-		if bucket == "" {
+	if o.snapshotPath == "" {
+		if o.bucket == "" {
 			return errors.New("either -bucket or -snapshot must be provided")
 		}
-		p, err := defaultSnapshotPath(bucket, region)
+		p, err := defaultSnapshotPath(o.bucket, o.region)
 		if err != nil {
 			return err
 		}
-		snapshotPath = p
+		o.snapshotPath = p
 	}
 
-	var tree *radix.Tree
-
-	switch {
-	case loadOnly:
-		t, err := loadSnapshot(snapshotPath)
-		if err != nil {
-			return fmt.Errorf("load %s: %w", snapshotPath, err)
-		}
-		tree = t
-		log.Printf("loaded snapshot %s", snapshotPath)
-
-	default:
-		if bucket == "" {
-			return errors.New("-bucket is required when not using -load")
-		}
-		client, err := newS3Client(ctx, region, endpoint)
-		if err != nil {
-			return fmt.Errorf("init S3 client: %w", err)
-		}
-		// Resolve region from client config if it was auto-detected so cost
-		// calculations use the actual scan region.
-		if region == "" {
-			region = clientRegion(client)
-		}
-
-		tree = radix.New()
-		prog := NewProgress(region)
-
-		done := make(chan struct{})
-		go RunReporter(os.Stderr, prog, done, time.Duration(progressMs)*time.Millisecond)
-
-		scanner := NewScanner(client, bucket, workers, parallelDepth, tree, prog)
-		start := time.Now()
-		err = scanner.Run(ctx)
-		close(done)
-		// Give the reporter a moment to flush its final line cleanly.
-		time.Sleep(50 * time.Millisecond)
-		if err != nil {
-			return fmt.Errorf("scan: %w", err)
-		}
-		fmt.Fprintf(os.Stderr, "scan completed in %s\n", time.Since(start))
-
-		if err := saveSnapshot(snapshotPath, tree); err != nil {
-			return fmt.Errorf("save snapshot %s: %w", snapshotPath, err)
-		}
-		fmt.Fprintf(os.Stderr, "snapshot saved to %s\n", snapshotPath)
+	tree, err := acquireTree(ctx, &o)
+	if err != nil {
+		return err
 	}
 
-	if interactive {
-		return runTUI(tree, region)
+	if o.interactive {
+		return runTUI(tree, o.region)
 	}
-	return printSummary(tree, region)
+	return printSummary(tree, o.region)
+}
+
+// acquireTree returns the radix.Tree the rest of the program operates on.
+// In -load mode it deserialises from disk; otherwise it scans the bucket and
+// snapshots the result. o.region is updated in place when the SDK auto-
+// resolved it from the environment so cost calculations match the scan.
+func acquireTree(ctx context.Context, o *opts) (*radix.Tree, error) {
+	if o.loadOnly {
+		tree, err := loadSnapshot(o.snapshotPath)
+		if err != nil {
+			return nil, fmt.Errorf("load %s: %w", o.snapshotPath, err)
+		}
+		fmt.Fprintf(os.Stderr, "loaded snapshot %s\n", o.snapshotPath)
+		return tree, nil
+	}
+
+	if o.bucket == "" {
+		return nil, errors.New("-bucket is required when not using -load")
+	}
+	client, err := newS3Client(ctx, o.region, o.endpoint)
+	if err != nil {
+		return nil, fmt.Errorf("init S3 client: %w", err)
+	}
+	if o.region == "" {
+		o.region = client.Options().Region
+	}
+
+	tree := radix.New()
+	prog := NewProgress(o.region)
+
+	// Reporter is joined via WaitGroup so its final progress line is fully
+	// flushed before the next stderr write — replaces the previous
+	// time.Sleep-and-hope.
+	done := make(chan struct{})
+	var reporterWG sync.WaitGroup
+	reporterWG.Go(func() {
+		RunReporter(os.Stderr, prog, done, o.progressEvery)
+	})
+
+	scanner := NewScanner(client, o.bucket, o.workers, o.parallelDepth, tree, prog)
+	start := time.Now()
+	scanErr := scanner.Run(ctx)
+	close(done)
+	reporterWG.Wait()
+
+	if scanErr != nil {
+		return nil, scanErr
+	}
+	fmt.Fprintf(os.Stderr, "scan completed in %s\n", time.Since(start))
+
+	if err := saveSnapshot(o.snapshotPath, tree); err != nil {
+		return nil, fmt.Errorf("save snapshot %s: %w", o.snapshotPath, err)
+	}
+	fmt.Fprintf(os.Stderr, "snapshot saved to %s\n", o.snapshotPath)
+	return tree, nil
 }
 
 // printSummary prints the top-level directory listing along with totals when
@@ -223,10 +247,3 @@ func newS3Client(ctx context.Context, region, endpoint string) (*s3.Client, erro
 	}), nil
 }
 
-// clientRegion returns the region the s3.Client is configured with, or "".
-func clientRegion(c *s3.Client) string {
-	// The SDK exposes the region only on Options; capture it via a no-op
-	// Options mutator just before returning the client. Easier path: read it
-	// from the SDK helper.
-	return c.Options().Region
-}
