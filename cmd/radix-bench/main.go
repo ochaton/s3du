@@ -23,30 +23,70 @@ func main() {
 		path      = flag.String("input", "test.objects.jsonl", "JSONL file with {key,size,class}")
 		batchSize = flag.Int("batch", 1000, "objects per AddBatch call")
 		list      = flag.String("list", "\x00", "if set (use \"\" for root), print ListDirectory(prefix) after build")
+		saveTo    = flag.String("save", "", "if set, write a binary snapshot to this path after build")
+		loadFrom  = flag.String("load", "", "if set, load the tree from this snapshot path instead of building")
 	)
 	flag.Parse()
 
-	objs, err := loadJSONL(*path)
-	if err != nil {
-		log.Fatalf("load: %v", err)
-	}
-	log.Printf("loaded %d objects from %s", len(objs), *path)
+	var (
+		tr      *radix.Tree
+		nObjs   int
+		elapsed time.Duration
+	)
 
 	runtime.GC()
 	var before runtime.MemStats
 	runtime.ReadMemStats(&before)
 
-	start := time.Now()
-	tr := buildTree(objs, *batchSize)
-	elapsed := time.Since(start)
+	if *loadFrom != "" {
+		f, err := os.Open(*loadFrom)
+		if err != nil {
+			log.Fatalf("open snapshot: %v", err)
+		}
+		start := time.Now()
+		tr, err = radix.Load(f)
+		elapsed = time.Since(start)
+		_ = f.Close()
+		if err != nil {
+			log.Fatalf("Load: %v", err)
+		}
+		nObjs = countObjects(tr)
+		log.Printf("loaded snapshot from %s in %s (%d objects, %.0f obj/sec)",
+			*loadFrom, elapsed, nObjs, float64(nObjs)/elapsed.Seconds())
+	} else {
+		objs, err := loadJSONL(*path)
+		if err != nil {
+			log.Fatalf("load: %v", err)
+		}
+		log.Printf("loaded %d objects from %s", len(objs), *path)
+		nObjs = len(objs)
+		start := time.Now()
+		tr = buildTree(objs, *batchSize)
+		elapsed = time.Since(start)
+		log.Printf("built in %s (%.0f obj/sec)", elapsed, float64(len(objs))/elapsed.Seconds())
+	}
 
 	runtime.GC()
 	var after runtime.MemStats
 	runtime.ReadMemStats(&after)
 
 	heap := after.HeapAlloc - before.HeapAlloc
-	log.Printf("built in %s (%.0f obj/sec)", elapsed, float64(len(objs))/elapsed.Seconds())
-	log.Printf("heap: %d bytes (%.1f bytes/object)", heap, float64(heap)/float64(len(objs)))
+	log.Printf("heap: %d bytes (%.1f bytes/object)", heap, float64(heap)/float64(nObjs))
+
+	if *saveTo != "" {
+		f, err := os.Create(*saveTo)
+		if err != nil {
+			log.Fatalf("create snapshot: %v", err)
+		}
+		start := time.Now()
+		if err := tr.Save(f); err != nil {
+			log.Fatalf("Save: %v", err)
+		}
+		_ = f.Close()
+		info, _ := os.Stat(*saveTo)
+		log.Printf("saved snapshot to %s in %s (%d bytes, %.1f bytes/object)",
+			*saveTo, time.Since(start), info.Size(), float64(info.Size())/float64(nObjs))
+	}
 
 	if *list != "\x00" {
 		entries, err := tr.ListDirectory(*list)
@@ -61,6 +101,12 @@ func main() {
 	log.Printf("edge bytes: %d total, %.1f avg, %d max", stats.edgeBytes, float64(stats.edgeBytes)/float64(stats.nodes), stats.maxEdge)
 	log.Printf("depth (nodes): max=%d, p50=%d, p99=%d", stats.maxDepth, stats.p50Depth, stats.p99Depth)
 	log.Printf("fanout: max=%d, avg=%.2f", stats.maxFanout, stats.avgFanout)
+}
+
+func countObjects(tr *radix.Tree) int {
+	n := 0
+	tr.Export(func(radix.Object) bool { n++; return true })
+	return n
 }
 
 func buildTree(objs []radix.Object, batchSize int) *radix.Tree {

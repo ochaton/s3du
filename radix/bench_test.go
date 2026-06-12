@@ -1,6 +1,7 @@
 package radix
 
 import (
+	"bytes"
 	"os"
 	"runtime"
 	"testing"
@@ -63,6 +64,44 @@ func BenchmarkAddBatch10(b *testing.B) {
 		buildTree(objs, 10)
 	}
 	b.ReportMetric(float64(len(objs))*float64(b.N)/b.Elapsed().Seconds(), "objects/sec")
+}
+
+// BenchmarkSave measures snapshot write throughput on the loaded dataset.
+func BenchmarkSave(b *testing.B) {
+	objs := loadRealDataset(b)
+	tr := buildTree(objs, 1000)
+	var buf bytes.Buffer
+	if err := tr.Save(&buf); err != nil {
+		b.Fatalf("Save: %v", err)
+	}
+	b.SetBytes(int64(buf.Len()))
+	b.ReportAllocs()
+	b.ResetTimer()
+	for b.Loop() {
+		buf.Reset()
+		_ = tr.Save(&buf)
+	}
+}
+
+// BenchmarkLoad measures snapshot read throughput. The snapshot is built
+// once outside the loop; each iteration reconstructs a fresh tree from the
+// same bytes.
+func BenchmarkLoad(b *testing.B) {
+	objs := loadRealDataset(b)
+	tr := buildTree(objs, 1000)
+	var buf bytes.Buffer
+	if err := tr.Save(&buf); err != nil {
+		b.Fatalf("Save: %v", err)
+	}
+	snap := buf.Bytes()
+	b.SetBytes(int64(len(snap)))
+	b.ReportAllocs()
+	b.ResetTimer()
+	for b.Loop() {
+		if _, err := Load(bytes.NewReader(snap)); err != nil {
+			b.Fatalf("Load: %v", err)
+		}
+	}
 }
 
 // BenchmarkAddBatchIdempotent stresses the cursor merge path: the tree is
