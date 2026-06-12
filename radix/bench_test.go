@@ -65,6 +65,26 @@ func BenchmarkAddBatch10(b *testing.B) {
 	b.ReportMetric(float64(len(objs))*float64(b.N)/b.Elapsed().Seconds(), "objects/sec")
 }
 
+// BenchmarkAddBatchIdempotent stresses the cursor merge path: the tree is
+// already built, the same dataset is re-batched, every key matches → no
+// inserts/updates/deletes are issued, only cursor scanning + comparison.
+func BenchmarkAddBatchIdempotent(b *testing.B) {
+	objs := loadRealDataset(b)
+	tr := buildTree(objs, 1000)
+	const batchSize = 1000
+	b.ReportAllocs()
+	b.ResetTimer()
+	for b.Loop() {
+		prev := ""
+		for start := 0; start < len(objs); start += batchSize {
+			end := min(start+batchSize, len(objs))
+			_ = tr.AddBatch(Batch{StartFrom: prev, Objects: objs[start:end]})
+			prev = objs[end-1].Key
+		}
+	}
+	b.ReportMetric(float64(len(objs))*float64(b.N)/b.Elapsed().Seconds(), "objects/sec")
+}
+
 func BenchmarkBuildHeap(b *testing.B) {
 	objs := loadRealDataset(b)
 	b.ReportAllocs()

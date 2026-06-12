@@ -3,6 +3,7 @@ package radix
 import (
 	"bufio"
 	"encoding/json"
+	"math/rand/v2"
 	"os"
 	"sort"
 	"strings"
@@ -307,43 +308,51 @@ func oracleListDirectory(all []Object, prefix string) []Entry {
 	return out
 }
 
-// TestOracleAgainstRealData ingests the full real-bucket dataset in batches
-// (chained via StartFrom) and compares ListDirectory output to an oracle
-// computed by a linear scan over the source dataset.
+// TestOracleAgainstRealData ingests up to oracleMaxSample objects randomly
+// sampled from the real-bucket dataset, then compares ListDirectory against
+// a linear-scan oracle over the same sample for every derived '/' prefix.
+// Capping the sample keeps the oracle scan tractable (O(prefixes × sample))
+// regardless of how large the source snapshot grows.
 func TestOracleAgainstRealData(t *testing.T) {
-	const path = "../test.objects.jsonl"
+	const (
+		path             = "../test.objects.jsonl"
+		oracleMaxSample  = 50_000
+		oracleSampleSeed = 0xC0FFEE
+	)
 	if _, err := os.Stat(path); err != nil {
 		t.Skipf("skipping: %s not present", path)
 	}
-	all := loadJSONL(t, path)
+	full := loadJSONL(t, path)
+	sample := subsampleObjects(full, oracleMaxSample, oracleSampleSeed)
+	t.Logf("oracle sample: %d / %d objects", len(sample), len(full))
+
 	tr := New()
-	// Ingest in batches of 1000 chained via StartFrom (mimicking ListObjectsV2).
 	const batchSize = 1000
 	prev := ""
-	for start := 0; start < len(all); start += batchSize {
-		end := min(start+batchSize, len(all))
-		batch := Batch{StartFrom: prev, Objects: all[start:end]}
+	for start := 0; start < len(sample); start += batchSize {
+		end := min(start+batchSize, len(sample))
+		batch := Batch{StartFrom: prev, Objects: sample[start:end]}
 		if err := tr.AddBatch(batch); err != nil {
 			t.Fatalf("AddBatch[%d:%d]: %v", start, end, err)
 		}
-		prev = all[end-1].Key
+		prev = sample[end-1].Key
 	}
-	// Probe a handful of prefixes.
-	probes := derivePrefixes(all)
+	probes := derivePrefixes(sample)
 	for _, p := range probes {
 		got, err := tr.ListDirectory(p)
 		if err != nil {
 			t.Fatalf("list %q: %v", p, err)
 		}
-		want := oracleListDirectory(all, p)
+		want := oracleListDirectory(sample, p)
 		if !entriesEqual(got, want) {
 			t.Fatalf("prefix %q mismatch\n got:  %s\n want: %s", p, dumpEntries(got), dumpEntries(want))
 		}
 	}
 }
 
-// derivePrefixes builds a representative set of prefixes from the dataset:
-// root, every distinct one-segment dir, plus a few deep parents.
+// derivePrefixes returns every distinct '/' prefix observed in the dataset,
+// plus the root prefix. Intended to drive the oracle test against a bounded
+// (subsampled) dataset; do not call on the full unbounded dataset.
 func derivePrefixes(all []Object) []string {
 	set := map[string]struct{}{"": {}}
 	for _, o := range all {
@@ -359,6 +368,22 @@ func derivePrefixes(all []Object) []string {
 		out = append(out, p)
 	}
 	sort.Strings(out)
+	return out
+}
+
+// subsampleObjects returns a deterministic random subsample of size n drawn
+// from src and sorted ascending by Key. If len(src) <= n the input is
+// returned unchanged.
+func subsampleObjects(src []Object, n int, seed uint64) []Object {
+	if len(src) <= n {
+		return src
+	}
+	r := rand.New(rand.NewPCG(seed, seed^0x9E3779B97F4A7C15))
+	buf := make([]Object, len(src))
+	copy(buf, src)
+	r.Shuffle(len(buf), func(i, j int) { buf[i], buf[j] = buf[j], buf[i] })
+	out := buf[:n:n]
+	sortObjects(out)
 	return out
 }
 

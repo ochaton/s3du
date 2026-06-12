@@ -9,3 +9,9 @@
 # local test datasets
 test.list.txt
 test.objects.jsonl
+
+# profiling output
+profiles/
+
+# go test binaries left in cwd
+*.test

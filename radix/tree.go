@@ -10,12 +10,16 @@ import (
 //	edge:     compressed path fragment from the parent node (empty only on root).
 //	children: sorted ascending by the first byte of their edge; Patricia
 //	          invariant guarantees each first byte is unique among siblings.
-//	file:     non-nil iff a key terminates exactly at this node.
+//	file:     populated iff hasFile is true (a key terminates exactly here).
 //	agg:      recursive aggregate over the entire subtree rooted at this node.
+//
+// fileMeta is inlined rather than referenced via pointer to remove one
+// allocation per file leaf on the ingest hot path.
 type node struct {
 	edge     string
 	children []*node
-	file     *fileMeta
+	file     fileMeta
+	hasFile  bool
 	agg      Aggregate
 }
 
@@ -46,6 +50,13 @@ func New() *Tree {
 //
 // An empty Objects slice is a no-op (range deletion via an empty batch is not
 // supported yet).
+//
+// Implementation: a rangeCursor streams existing leaves in (StartFrom, hi]
+// lock-step against the incoming batch via a three-way merge. The merge does
+// not mutate the tree directly; it accumulates conflict-free insert/update/
+// delete groups. Pure-insert batches (the dominant case during first-scan
+// import) skip allocation entirely by handing the input slice straight to
+// [Tree.insertBatch].
 func (t *Tree) AddBatch(b Batch) error {
 	if len(b.Objects) == 0 {
 		return nil
@@ -55,31 +66,44 @@ func (t *Tree) AddBatch(b Batch) error {
 	}
 	hi := b.Objects[len(b.Objects)-1].Key
 
-	existing := t.collectRange(b.StartFrom, hi)
+	cur := t.newRangeCursor(b.StartFrom, hi)
+	existing, hasExisting := cur.Next()
+	if !hasExisting {
+		t.insertBatch(b.Objects)
+		return nil
+	}
 
-	i, j := 0, 0
-	for i < len(existing) || j < len(b.Objects) {
+	var (
+		inserts []Object
+		updates []Object
+		deletes []string
+	)
+	j := 0
+	for hasExisting || j < len(b.Objects) {
 		switch {
 		case j >= len(b.Objects):
-			t.deleteKey(existing[i].Key)
-			i++
-		case i >= len(existing):
-			t.insertKey(b.Objects[j])
+			deletes = append(deletes, existing.Key)
+			existing, hasExisting = cur.Next()
+		case !hasExisting:
+			inserts = append(inserts, b.Objects[j])
 			j++
-		case existing[i].Key < b.Objects[j].Key:
-			t.deleteKey(existing[i].Key)
-			i++
-		case existing[i].Key > b.Objects[j].Key:
-			t.insertKey(b.Objects[j])
+		case existing.Key < b.Objects[j].Key:
+			deletes = append(deletes, existing.Key)
+			existing, hasExisting = cur.Next()
+		case existing.Key > b.Objects[j].Key:
+			inserts = append(inserts, b.Objects[j])
 			j++
 		default:
-			if existing[i].Size != b.Objects[j].Size || existing[i].Class != b.Objects[j].Class {
-				t.updateKey(b.Objects[j])
+			if existing.Size != b.Objects[j].Size || existing.Class != b.Objects[j].Class {
+				updates = append(updates, b.Objects[j])
 			}
-			i++
+			existing, hasExisting = cur.Next()
 			j++
 		}
 	}
+	t.deleteBatch(deletes)
+	t.updateBatch(updates)
+	t.insertBatch(inserts)
 	return nil
 }
 
@@ -135,7 +159,7 @@ func (t *Tree) ListDirectory(prefix string) ([]Entry, error) {
 // name so callers may distinguish or filter it.
 func listAtNode(n *node) []Entry {
 	out := make([]Entry, 0, len(n.children)+1)
-	if n.file != nil {
+	if n.hasFile {
 		out = append(out, Entry{
 			Name:  "",
 			IsDir: false,
@@ -162,7 +186,7 @@ func listInsideEdge(child *node, consumed string) []Entry {
 		}}
 	}
 	out := make([]Entry, 0, len(child.children)+1)
-	if child.file != nil {
+	if child.hasFile {
 		out = append(out, Entry{
 			Name:  residual,
 			IsDir: false,
@@ -191,7 +215,7 @@ func emitFromNode(n *node, acc string, out []Entry) []Entry {
 		})
 	}
 	fullName := acc + n.edge
-	if n.file != nil {
+	if n.hasFile {
 		out = append(out, Entry{
 			Name:  fullName,
 			IsDir: false,
@@ -236,69 +260,75 @@ func longestCommonPrefix(a, b string) int {
 	return n
 }
 
-// insertKey inserts obj into the tree, creating/splitting nodes as needed, and
-// propagates the aggregate delta along the resulting path.
-func (t *Tree) insertKey(obj Object) {
-	path := make([]*node, 0, 8)
-	cur := t.root
-	path = append(path, cur)
-	rem := obj.Key
+// framePath is one entry in a descent stack. consumed counts how many bytes
+// of the active key have been "covered" by the path from root to and
+// including n.edge — used by [Tree.insertBatch]'s LCP fast-path to compare
+// against the next key without re-descending from the root.
+type framePath struct {
+	n        *node
+	consumed int
+}
 
+// insertBatch inserts a sorted, conflict-free slice of objects.
+func (t *Tree) insertBatch(objs []Object) {
+	for i := range objs {
+		t.insert(t.root, objs[i].Key, objs[i])
+	}
+}
+
+// insert places obj into the subtree rooted at n, descending iteratively
+// until n's path equals obj.Key. n.agg is bumped on every descent step, so
+// each ancestor's aggregate is correct without a separate fix-up pass.
+func (t *Tree) insert(n *node, key string, obj Object) {
 	for {
-		if rem == "" {
-			cur.file = &fileMeta{Class: obj.Class, Size: obj.Size}
-			applyDelta(path, obj.Class, obj.Size, +1)
+		n.agg.Objects++
+		n.agg.Bytes.Add(obj.Class, obj.Size)
+
+		if key == "" {
+			n.file = fileMeta{Class: obj.Class, Size: obj.Size}
+			n.hasFile = true
 			return
 		}
-		idx, ok := findChild(cur.children, rem[0])
+		idx, ok := findChild(n.children, key[0])
 		if !ok {
 			leaf := &node{
-				edge: rem,
-				file: &fileMeta{Class: obj.Class, Size: obj.Size},
+				edge:    key,
+				file:    fileMeta{Class: obj.Class, Size: obj.Size},
+				hasFile: true,
 			}
-			cur.children = insertChildAt(cur.children, idx, leaf)
-			path = append(path, leaf)
-			applyDelta(path, obj.Class, obj.Size, +1)
+			leaf.agg.Objects = 1
+			leaf.agg.Bytes.Add(obj.Class, obj.Size)
+			n.children = insertChildAt(n.children, idx, leaf)
 			return
 		}
-		child := cur.children[idx]
-		lcp := longestCommonPrefix(child.edge, rem)
-		switch {
-		case lcp == len(child.edge):
-			cur = child
-			rem = rem[lcp:]
-			path = append(path, cur)
-		case lcp == len(rem):
-			// rem is a strict prefix of child.edge: split so that the new key
-			// terminates at the new intermediate node.
-			intermediate := &node{
-				edge: child.edge[:lcp],
-				file: &fileMeta{Class: obj.Class, Size: obj.Size},
-				agg:  child.agg,
-			}
-			child.edge = child.edge[lcp:]
+		child := n.children[idx]
+		lcp := longestCommonPrefix(child.edge, key)
+		if lcp == len(child.edge) {
+			n = child
+			key = key[lcp:]
+			continue
+		}
+		// Split: child.edge[:lcp] is shared with key; create new intermediate.
+		intermediate := &node{edge: child.edge[:lcp], agg: child.agg}
+		intermediate.agg.Objects++
+		intermediate.agg.Bytes.Add(obj.Class, obj.Size)
+		child.edge = child.edge[lcp:]
+		if lcp == len(key) {
+			intermediate.file = fileMeta{Class: obj.Class, Size: obj.Size}
+			intermediate.hasFile = true
 			intermediate.children = []*node{child}
-			cur.children[idx] = intermediate
-			path = append(path, intermediate)
-			applyDelta(path, obj.Class, obj.Size, +1)
-			return
-		default:
-			// generic split: child.edge and rem diverge after lcp bytes.
-			intermediate := &node{
-				edge: child.edge[:lcp],
-				agg:  child.agg,
-			}
-			child.edge = child.edge[lcp:]
+		} else {
 			leaf := &node{
-				edge: rem[lcp:],
-				file: &fileMeta{Class: obj.Class, Size: obj.Size},
+				edge:    key[lcp:],
+				file:    fileMeta{Class: obj.Class, Size: obj.Size},
+				hasFile: true,
 			}
+			leaf.agg.Objects = 1
+			leaf.agg.Bytes.Add(obj.Class, obj.Size)
 			intermediate.children = sortChildren(child, leaf)
-			cur.children[idx] = intermediate
-			path = append(path, intermediate, leaf)
-			applyDelta(path, obj.Class, obj.Size, +1)
-			return
 		}
+		n.children[idx] = intermediate
+		return
 	}
 }
 
@@ -312,15 +342,16 @@ func sortChildren(a, b *node) []*node {
 // deleteKey removes key from the tree and propagates the negative aggregate
 // delta. Empty branches are pruned and single-child compression is restored.
 func (t *Tree) deleteKey(key string) {
-	type frame struct {
+	type pop struct {
 		parent   *node
 		childIdx int
 	}
-	stack := make([]frame, 0, 8)
-	path := make([]*node, 0, 8)
+	pops := make([]pop, 0, 8)
+	path := make([]framePath, 1, 8)
+	path[0] = framePath{n: t.root, consumed: 0}
 	cur := t.root
-	path = append(path, cur)
 	rem := key
+	consumed := 0
 
 	for rem != "" {
 		idx, ok := findChild(cur.children, rem[0])
@@ -331,27 +362,30 @@ func (t *Tree) deleteKey(key string) {
 		if !strings.HasPrefix(rem, child.edge) {
 			return
 		}
-		stack = append(stack, frame{parent: cur, childIdx: idx})
+		pops = append(pops, pop{parent: cur, childIdx: idx})
 		cur = child
-		path = append(path, cur)
+		consumed += len(child.edge)
 		rem = rem[len(child.edge):]
+		path = append(path, framePath{n: cur, consumed: consumed})
 	}
-	if cur.file == nil {
+	if !cur.hasFile {
 		return
 	}
 	class, size := cur.file.Class, cur.file.Size
-	cur.file = nil
+	cur.file = fileMeta{}
+	cur.hasFile = false
 	applyDelta(path, class, -size, -1)
 
 	// Bottom-up cleanup: prune empty leaves; merge single-child no-file nodes
-	// back into a single compressed edge.
-	for i := len(stack) - 1; i >= 0; i-- {
-		fr := stack[i]
+	// back into a single compressed edge. Pruned nodes are not returned to the
+	// pool — chunks are append-only.
+	for i := len(pops) - 1; i >= 0; i-- {
+		fr := pops[i]
 		n := fr.parent.children[fr.childIdx]
 		switch {
-		case n.file == nil && len(n.children) == 0:
+		case !n.hasFile && len(n.children) == 0:
 			fr.parent.children = append(fr.parent.children[:fr.childIdx], fr.parent.children[fr.childIdx+1:]...)
-		case n.file == nil && len(n.children) == 1:
+		case !n.hasFile && len(n.children) == 1:
 			only := n.children[0]
 			only.edge = n.edge + only.edge
 			fr.parent.children[fr.childIdx] = only
@@ -364,10 +398,11 @@ func (t *Tree) deleteKey(key string) {
 // updateKey changes the file metadata for an existing key and adjusts
 // aggregates by the difference. Assumes the key currently exists.
 func (t *Tree) updateKey(obj Object) {
-	path := make([]*node, 0, 8)
+	path := make([]framePath, 1, 8)
+	path[0] = framePath{n: t.root, consumed: 0}
 	cur := t.root
-	path = append(path, cur)
 	rem := obj.Key
+	consumed := 0
 	for rem != "" {
 		idx, ok := findChild(cur.children, rem[0])
 		if !ok {
@@ -378,14 +413,15 @@ func (t *Tree) updateKey(obj Object) {
 			return
 		}
 		cur = child
-		path = append(path, cur)
+		consumed += len(child.edge)
 		rem = rem[len(child.edge):]
+		path = append(path, framePath{n: cur, consumed: consumed})
 	}
-	if cur.file == nil {
+	if !cur.hasFile {
 		return
 	}
 	oldClass, oldSize := cur.file.Class, cur.file.Size
-	cur.file = &fileMeta{Class: obj.Class, Size: obj.Size}
+	cur.file = fileMeta{Class: obj.Class, Size: obj.Size}
 	if oldClass == obj.Class {
 		if d := obj.Size - oldSize; d != 0 {
 			applyDelta(path, obj.Class, d, 0)
@@ -396,10 +432,27 @@ func (t *Tree) updateKey(obj Object) {
 	applyDelta(path, obj.Class, obj.Size, +1)
 }
 
+// updateBatch applies updateKey to each object in the slice. Conflicts are
+// assumed to be pre-resolved by the caller (all keys present in the tree).
+func (t *Tree) updateBatch(objs []Object) {
+	for i := range objs {
+		t.updateKey(objs[i])
+	}
+}
+
+// deleteBatch applies deleteKey to each key in the slice. Conflicts are
+// assumed to be pre-resolved (all keys present).
+func (t *Tree) deleteBatch(keys []string) {
+	for _, k := range keys {
+		t.deleteKey(k)
+	}
+}
+
 // applyDelta walks the path from root to leaf applying the per-class byte
 // delta and the object-count delta to each node's aggregate.
-func applyDelta(path []*node, class string, sizeDelta, objDelta int64) {
-	for _, n := range path {
+func applyDelta(path []framePath, class string, sizeDelta, objDelta int64) {
+	for i := range path {
+		n := path[i].n
 		n.agg.Objects += objDelta
 		if sizeDelta != 0 {
 			n.agg.Bytes.Add(class, sizeDelta)
@@ -407,28 +460,69 @@ func applyDelta(path []*node, class string, sizeDelta, objDelta int64) {
 	}
 }
 
-// collectRange returns all objects in the tree with key in (lo, hi], in
-// ascending lex order. Prunes subtrees that cannot overlap the range.
-func (t *Tree) collectRange(lo, hi string) []Object {
-	return walkRange(t.root, "", lo, hi, make([]Object, 0, 64))
+// rangeCursor is a stack-based iterator over leaves whose key lies in
+// (lo, hi]. It allocates only the cursor itself and its stack slice (sized
+// to tree depth) regardless of how many leaves the range contains. The
+// caller drives iteration via repeated [rangeCursor.Next] calls; the cursor
+// terminates either when the stack drains or when subtree pruning rules out
+// the remaining tree.
+//
+// rangeCursor reads the tree only — mutations made by the caller between
+// Next calls (e.g. AddBatch's downstream insertBatch/updateBatch/deleteBatch
+// passes) are not safe to interleave with iteration. AddBatch arranges its
+// callers so the cursor is fully drained before any mutation happens.
+type rangeCursor struct {
+	stack  []cursorFrame
+	lo, hi string
 }
 
-func walkRange(n *node, key, lo, hi string, out []Object) []Object {
-	if n.file != nil && key > lo && key <= hi {
-		out = append(out, Object{Key: key, Size: n.file.Size, Class: n.file.Class})
+type cursorFrame struct {
+	n           *node
+	prefix      string // bytes from root including n.edge
+	nextChild   int    // index of next unvisited child
+	fileEmitted bool
+}
+
+func (t *Tree) newRangeCursor(lo, hi string) *rangeCursor {
+	rc := &rangeCursor{
+		lo:    lo,
+		hi:    hi,
+		stack: make([]cursorFrame, 1, 16),
 	}
-	for _, c := range n.children {
-		childKey := key + c.edge
-		if childKey > hi {
-			// All subsequent siblings have a strictly greater first byte, hence
-			// strictly greater childKey; safe to break.
-			break
+	rc.stack[0] = cursorFrame{n: t.root}
+	return rc
+}
+
+// Next returns the next object whose key falls in (lo, hi], in ascending lex
+// order. Returns (_, false) once the iteration is exhausted; subsequent calls
+// continue to return false.
+func (rc *rangeCursor) Next() (Object, bool) {
+	for len(rc.stack) > 0 {
+		top := &rc.stack[len(rc.stack)-1]
+		if !top.fileEmitted {
+			top.fileEmitted = true
+			if top.n.hasFile && top.prefix > rc.lo && top.prefix <= rc.hi {
+				return Object{Key: top.prefix, Size: top.n.file.Size, Class: top.n.file.Class}, true
+			}
 		}
-		if childKey < lo && !strings.HasPrefix(lo, childKey) {
+		if top.nextChild >= len(top.n.children) {
+			rc.stack = rc.stack[:len(rc.stack)-1]
 			continue
 		}
-		out = walkRange(c, childKey, lo, hi, out)
+		c := top.n.children[top.nextChild]
+		top.nextChild++
+		childKey := top.prefix + c.edge
+		// All subsequent siblings have a strictly greater first byte, hence
+		// strictly greater childKey — once one exceeds hi, pop the frame.
+		if childKey > rc.hi {
+			rc.stack = rc.stack[:len(rc.stack)-1]
+			continue
+		}
+		if childKey < rc.lo && !strings.HasPrefix(rc.lo, childKey) {
+			continue
+		}
+		rc.stack = append(rc.stack, cursorFrame{n: c, prefix: childKey})
 	}
-	return out
+	return Object{}, false
 }
 
