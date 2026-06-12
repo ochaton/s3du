@@ -24,11 +24,11 @@ type tuiModel struct {
 	region  string
 	width   int
 	height  int
-	prefix  string             // current directory prefix ("" for root)
-	stack   []navFrame         // ancestry from root to prefix exclusive
-	entries []radix.Entry      // listing of prefix; recomputed on navigation
-	cursor  int                // selected entry index
-	err     error              // last navigation error, if any
+	prefix  string        // current directory prefix ("" for root)
+	stack   []navFrame    // ancestry from root to prefix exclusive
+	entries []radix.Entry // listing of prefix; recomputed on navigation
+	cursor  int           // selected entry index
+	err     error         // last navigation error, if any
 }
 
 // navFrame remembers the cursor position at each ancestor so going back
@@ -137,13 +137,16 @@ func (m *tuiModel) ascend() {
 	m.reload()
 }
 
-// Styling.
+// Styling. The fixed-color choices were unreadable on some terminals (the
+// "blue" ANSI slot renders as dark purple on common macOS schemes). Use
+// terminal-native effects (bold, reverse, faint) which respect the user's
+// scheme.
 var (
-	headerStyle    = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("12"))
-	selectedStyle  = lipgloss.NewStyle().Foreground(lipgloss.Color("0")).Background(lipgloss.Color("12"))
-	dirStyle       = lipgloss.NewStyle().Foreground(lipgloss.Color("12"))
-	dimStyle       = lipgloss.NewStyle().Foreground(lipgloss.Color("8"))
-	errStyle       = lipgloss.NewStyle().Foreground(lipgloss.Color("9"))
+	headerStyle    = lipgloss.NewStyle().Bold(true)
+	selectedStyle  = lipgloss.NewStyle().Reverse(true)
+	dirStyle       = lipgloss.NewStyle().Bold(true)
+	dimStyle       = lipgloss.NewStyle().Faint(true)
+	errStyle       = lipgloss.NewStyle().Foreground(lipgloss.Color("9")) // bright red
 	footerHelpHint = "↑/↓ move · Enter/l descend · Backspace/h up · q quit"
 )
 
@@ -168,14 +171,18 @@ func (m *tuiModel) View() string {
 		return b.String()
 	}
 
-	// Layout: pad name column to width; rest is fixed-width metrics.
-	nameWidth := m.width - 50
-	if nameWidth < 20 {
-		nameWidth = 20
-	}
+	// Layout: pad name column to width; rest is fixed-width metrics (the
+	// extra class column adds ~21 chars to the non-name area).
+	nameWidth := max(m.width-60, 20)
+
+	// Column header row helps readers map values to fields.
+	header := fmt.Sprintf("%-*s  %-19s  %10s  %10s  %10s",
+		nameWidth, "name", "class", "objects", "bytes", "$/mo")
+	b.WriteString(dimStyle.Render(header))
+	b.WriteString("\n")
 
 	// Body rows.
-	startRow, endRow := visibleRange(m.cursor, m.height-5, len(m.entries))
+	startRow, endRow := visibleRange(m.cursor, m.height-6, len(m.entries))
 	for i := startRow; i < endRow; i++ {
 		e := m.entries[i]
 		line := renderRow(e, m.region, nameWidth)
@@ -188,12 +195,16 @@ func (m *tuiModel) View() string {
 		b.WriteString("\n")
 	}
 
-	// Status line: total + cost for the current directory.
+	// Status: totals + per-class breakdown across all entries in this listing.
 	totalObj, totalBytes, totalCost := dirTotals(m.entries, m.region)
 	b.WriteString("\n")
 	b.WriteString(dimStyle.Render(fmt.Sprintf("total: %d objects · %s · %s/mo",
 		totalObj, humanBytes(totalBytes), humanDollars(totalCost))))
 	b.WriteString("\n")
+	if cb := classBreakdown(m.entries); cb != "" {
+		b.WriteString(dimStyle.Render("classes: " + cb))
+		b.WriteString("\n")
+	}
 	b.WriteString(dimStyle.Render(footerHelpHint))
 	return b.String()
 }
@@ -208,10 +219,7 @@ func visibleRange(cursor, rows, total int) (int, int) {
 		return 0, total
 	}
 	half := rows / 2
-	start := cursor - half
-	if start < 0 {
-		start = 0
-	}
+	start := max(cursor-half, 0)
 	end := start + rows
 	if end > total {
 		end = total
@@ -220,12 +228,16 @@ func visibleRange(cursor, rows, total int) (int, int) {
 	return start, end
 }
 
+// renderRow formats one entry as four columns: name, class info, size, cost.
+// Directories report the dominant class (and a "+N" marker if more than one
+// storage class is present in the subtree). Files render their own class.
+// Empty-name file entries are S3 directory markers (zero-byte objects whose
+// key equals the current prefix); they get a "." placeholder so the table
+// stays aligned.
 func renderRow(e radix.Entry, region string, nameWidth int) string {
 	name := e.Name
-	if e.IsDir {
-		// indicate dir with trailing slash (already in radix.Entry for dirs).
-	} else {
-		// nothing to add; file rows render their class/size.
+	if !e.IsDir && name == "" {
+		name = "."
 	}
 	if len(name) > nameWidth {
 		name = name[:nameWidth-1] + "…"
@@ -233,20 +245,41 @@ func renderRow(e radix.Entry, region string, nameWidth int) string {
 	if e.IsDir {
 		bytes := byteSum(e.Aggregate.Bytes)
 		cost := dirCost(e.Aggregate.Bytes, region)
-		return fmt.Sprintf("%-*s  %10d  %10s  %10s",
+		return fmt.Sprintf("%-*s  %-19s  %10d  %10s  %10s",
 			nameWidth, name,
+			dominantClassLabel(e.Aggregate.Bytes),
 			e.Aggregate.Objects,
 			humanBytes(bytes),
 			humanDollars(cost),
 		)
 	}
 	cost := monthlyStorageCost(e.Size, e.Class.String(), region)
-	return fmt.Sprintf("%-*s  %10s  %10s  %10s",
+	return fmt.Sprintf("%-*s  %-19s  %10s  %10s  %10s",
 		nameWidth, name,
 		e.Class.String(),
+		"",
 		humanBytes(e.Size),
 		humanDollars(cost),
 	)
+}
+
+// dominantClassLabel returns a compact label for a directory's class mix:
+// just the largest-by-bytes class when there is only one populated bucket,
+// or "<class> +N" when there are multiple.
+func dominantClassLabel(b radix.ClassBytes) string {
+	if len(b) == 0 {
+		return ""
+	}
+	top := b[0]
+	for _, kv := range b[1:] {
+		if kv.Size > top.Size {
+			top = kv
+		}
+	}
+	if len(b) == 1 {
+		return top.Class.String()
+	}
+	return fmt.Sprintf("%s +%d", top.Class.String(), len(b)-1)
 }
 
 // dirCost sums the monthly storage cost for an aggregate's ClassBytes.
@@ -256,6 +289,75 @@ func dirCost(b radix.ClassBytes, region string) float64 {
 		total += monthlyStorageCost(kv.Size, kv.Class.String(), region)
 	}
 	return total
+}
+
+// classBreakdown sums objects and bytes per storage class across every entry
+// in the listing (directories and files alike) and returns a single-line
+// compact summary like "GLACIER_IR: 49998 objs / 106.8 GiB · STANDARD: 2".
+func classBreakdown(entries []radix.Entry) string {
+	totals := map[radix.StorageClass]struct {
+		objs  int64
+		bytes int64
+	}{}
+	for _, e := range entries {
+		if e.IsDir {
+			// Aggregate.Bytes lists the per-class byte totals across the
+			// subtree; the per-class object counts are not tracked
+			// separately so we attribute every dir's Objects to its
+			// dominant class. Not perfect but readable.
+			top := dominantClassFor(e.Aggregate.Bytes)
+			t := totals[top]
+			t.objs += e.Aggregate.Objects
+			for _, kv := range e.Aggregate.Bytes {
+				bucket := totals[kv.Class]
+				bucket.bytes += kv.Size
+				if kv.Class == top {
+					bucket.objs = t.objs
+				}
+				totals[kv.Class] = bucket
+			}
+			continue
+		}
+		b := totals[e.Class]
+		b.objs++
+		b.bytes += e.Size
+		totals[e.Class] = b
+	}
+	if len(totals) == 0 {
+		return ""
+	}
+	// Order classes by enum value for stable rendering.
+	classes := make([]radix.StorageClass, 0, len(totals))
+	for c := range totals {
+		classes = append(classes, c)
+	}
+	for i := 1; i < len(classes); i++ {
+		for j := i; j > 0 && classes[j-1] > classes[j]; j-- {
+			classes[j-1], classes[j] = classes[j], classes[j-1]
+		}
+	}
+	parts := make([]string, 0, len(classes))
+	for _, c := range classes {
+		t := totals[c]
+		parts = append(parts, fmt.Sprintf("%s: %d / %s", c.String(), t.objs, humanBytes(t.bytes)))
+	}
+	return strings.Join(parts, " · ")
+}
+
+// dominantClassFor returns the class with the largest Size in b. Used as a
+// crude attribution of a dir's Objects count among its classes for the
+// status-line summary.
+func dominantClassFor(b radix.ClassBytes) radix.StorageClass {
+	if len(b) == 0 {
+		return radix.ClassUnknown
+	}
+	top := b[0]
+	for _, kv := range b[1:] {
+		if kv.Size > top.Size {
+			top = kv
+		}
+	}
+	return top.Class
 }
 
 // dirTotals collapses a listing's entries into totals for the status line.
