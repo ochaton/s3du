@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"slices"
 )
 
 // On-disk snapshot format (little-endian throughout).
@@ -60,23 +61,16 @@ var (
 // Save writes the tree's binary snapshot to w. The on-disk representation
 // keyed by arena ID means children references are byte-identical before save
 // and after Load — no pointer fixup, no second pass.
+//
+// To skip free slots without allocating an O(nextID) presence bitmap, Save
+// makes a sorted copy of the freelist (typically tiny — only grows on prune-
+// heavy deletes) and walks it in lock-step with the slot iteration.
 func (t *Tree) Save(w io.Writer) error {
 	bw := bufio.NewWriter(w)
 
-	// Mark live slots; the freelist tells us which IDs to skip.
-	alive := make([]bool, t.nextID)
-	for i := range alive {
-		alive[i] = true
-	}
-	for _, id := range t.free {
-		alive[id] = false
-	}
-	var aliveCount uint32
-	for _, ok := range alive {
-		if ok {
-			aliveCount++
-		}
-	}
+	sortedFree := append([]uint32(nil), t.free...)
+	slices.Sort(sortedFree)
+	aliveCount := t.nextID - uint32(len(sortedFree))
 
 	var maxID uint32
 	if t.nextID > 0 {
@@ -85,8 +79,11 @@ func (t *Tree) Save(w io.Writer) error {
 	if err := writeHeader(bw, maxID, aliveCount); err != nil {
 		return err
 	}
+
+	freeIdx := 0
 	for id := uint32(0); id < t.nextID; id++ {
-		if !alive[id] {
+		if freeIdx < len(sortedFree) && sortedFree[freeIdx] == id {
+			freeIdx++
 			continue
 		}
 		if err := writeNodeRecord(bw, id, t.at(id)); err != nil {
@@ -96,12 +93,16 @@ func (t *Tree) Save(w io.Writer) error {
 	return bw.Flush()
 }
 
+// loadReadBuffer is the bufio buffer size used by Load. 64 KB amortises the
+// per-call overhead of bufio's underlying Read across many record bytes.
+const loadReadBuffer = 64 << 10
+
 // Load reads a snapshot previously produced by Save and reconstructs the
 // in-memory tree. Arena chunks are sized exactly to fit max_id+1 nodes; gaps
 // between alive IDs are recovered into the freelist so future inserts reuse
 // them.
 func Load(r io.Reader) (*Tree, error) {
-	br := bufio.NewReader(r)
+	br := bufio.NewReaderSize(r, loadReadBuffer)
 	maxID, aliveCount, err := readHeader(br)
 	if err != nil {
 		return nil, err
@@ -250,6 +251,12 @@ func writeNodeRecord(w *bufio.Writer, id uint32, n *node) error {
 
 // readNodeRecord parses a single record from r and returns its ID and the
 // reconstructed node.
+//
+// Variable-sized sub-blocks (edge bytes, children IDs, agg entries) are
+// read via bufio.Reader.Peek so the decoder operates directly on the
+// reader's internal buffer — no scratch []byte allocations per record. The
+// reader must therefore be sized large enough to hold any single sub-block
+// (loadReadBuffer = 64 KB covers the uint16-limited edge length).
 func readNodeRecord(r *bufio.Reader) (uint32, node, error) {
 	var hdr [9]byte
 	if _, err := io.ReadFull(r, hdr[:]); err != nil {
@@ -262,20 +269,27 @@ func readNodeRecord(r *bufio.Reader) (uint32, node, error) {
 
 	var n node
 	if edgeLen > 0 {
-		edgeBuf := make([]byte, edgeLen)
-		if _, err := io.ReadFull(r, edgeBuf); err != nil {
+		buf, err := r.Peek(int(edgeLen))
+		if err != nil {
 			return 0, node{}, err
 		}
-		n.edge = string(edgeBuf)
+		n.edge = string(buf) // copies bytes into the string's own backing
+		if _, err := r.Discard(int(edgeLen)); err != nil {
+			return 0, node{}, err
+		}
 	}
 	if childrenN > 0 {
+		nb := int(childrenN) * 4
+		buf, err := r.Peek(nb)
+		if err != nil {
+			return 0, node{}, err
+		}
 		n.children = make([]uint32, childrenN)
-		var tmp [4]byte
 		for i := range n.children {
-			if _, err := io.ReadFull(r, tmp[:]); err != nil {
-				return 0, node{}, err
-			}
-			n.children[i] = binary.LittleEndian.Uint32(tmp[:])
+			n.children[i] = binary.LittleEndian.Uint32(buf[i*4:])
+		}
+		if _, err := r.Discard(nb); err != nil {
+			return 0, node{}, err
 		}
 	}
 	if flags&snapFlagHasFile != 0 {
@@ -296,16 +310,21 @@ func readNodeRecord(r *bufio.Reader) (uint32, node, error) {
 		agg := &Aggregate{Objects: int64(binary.LittleEndian.Uint64(ah[0:8]))}
 		aggN := ah[8]
 		if aggN > 0 {
+			nb := int(aggN) * 9
+			buf, err := r.Peek(nb)
+			if err != nil {
+				return 0, node{}, err
+			}
 			agg.Bytes = make(ClassBytes, aggN)
-			var eb [9]byte
-			for i := range aggN {
-				if _, err := io.ReadFull(r, eb[:]); err != nil {
-					return 0, node{}, err
-				}
+			for i := range agg.Bytes {
+				off := i * 9
 				agg.Bytes[i] = ClassByte{
-					Class: StorageClass(eb[0]),
-					Size:  int64(binary.LittleEndian.Uint64(eb[1:9])),
+					Class: StorageClass(buf[off]),
+					Size:  int64(binary.LittleEndian.Uint64(buf[off+1:])),
 				}
+			}
+			if _, err := r.Discard(nb); err != nil {
+				return 0, node{}, err
 			}
 		}
 		n.agg = agg
