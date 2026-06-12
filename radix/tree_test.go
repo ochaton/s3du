@@ -16,7 +16,7 @@ func objsToBatch(objs []Object) Batch {
 }
 
 func obj(key string, size int64, class string) Object {
-	return Object{Key: key, Size: size, Class: class}
+	return Object{Key: key, Size: size, Class: ParseClass(class)}
 }
 
 func sortObjects(objs []Object) {
@@ -50,7 +50,7 @@ func TestSingleObject(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ListDirectory: %v", err)
 	}
-	want := []Entry{{Name: "a.txt", IsDir: false, Class: "STANDARD", Size: 7}}
+	want := []Entry{{Name: "a.txt", IsDir: false, Class: ClassStandard, Size: 7}}
 	if !entriesEqual(entries, want) {
 		t.Fatalf("got %#v want %#v", entries, want)
 	}
@@ -70,8 +70,8 @@ func TestSplitOnInsert(t *testing.T) {
 		t.Fatal(err)
 	}
 	want := []Entry{
-		{Name: "abc.jpg", IsDir: false, Class: "STANDARD", Size: 10},
-		{Name: "abcdef/", IsDir: true, Aggregate: Aggregate{Objects: 1, Bytes: ClassBytes{GlacierIR: 20}}},
+		{Name: "abc.jpg", IsDir: false, Class: ClassStandard, Size: 10},
+		{Name: "abcdef/", IsDir: true, Aggregate: Aggregate{Objects: 1, Bytes: ClassBytes{{Class: ClassGlacierIR, Size: 20}}}},
 	}
 	if !entriesEqual(entries, want) {
 		t.Fatalf("got %#v want %#v", entries, want)
@@ -91,11 +91,11 @@ func TestDeepCompressedChain(t *testing.T) {
 		prefix string
 		want   []Entry
 	}{
-		{"", []Entry{{Name: "afk/", IsDir: true, Aggregate: Aggregate{Objects: 1, Bytes: ClassBytes{GlacierIR: 100}}}}},
-		{"afk/", []Entry{{Name: "images/", IsDir: true, Aggregate: Aggregate{Objects: 1, Bytes: ClassBytes{GlacierIR: 100}}}}},
-		{"afk/images/", []Entry{{Name: "2024/", IsDir: true, Aggregate: Aggregate{Objects: 1, Bytes: ClassBytes{GlacierIR: 100}}}}},
-		{"afk/images/2024/05/", []Entry{{Name: "09/", IsDir: true, Aggregate: Aggregate{Objects: 1, Bytes: ClassBytes{GlacierIR: 100}}}}},
-		{"afk/images/2024/05/09/", []Entry{{Name: "x.jpg", IsDir: false, Class: "GLACIER_IR", Size: 100}}},
+		{"", []Entry{{Name: "afk/", IsDir: true, Aggregate: Aggregate{Objects: 1, Bytes: ClassBytes{{Class: ClassGlacierIR, Size: 100}}}}}},
+		{"afk/", []Entry{{Name: "images/", IsDir: true, Aggregate: Aggregate{Objects: 1, Bytes: ClassBytes{{Class: ClassGlacierIR, Size: 100}}}}}},
+		{"afk/images/", []Entry{{Name: "2024/", IsDir: true, Aggregate: Aggregate{Objects: 1, Bytes: ClassBytes{{Class: ClassGlacierIR, Size: 100}}}}}},
+		{"afk/images/2024/05/", []Entry{{Name: "09/", IsDir: true, Aggregate: Aggregate{Objects: 1, Bytes: ClassBytes{{Class: ClassGlacierIR, Size: 100}}}}}},
+		{"afk/images/2024/05/09/", []Entry{{Name: "x.jpg", IsDir: false, Class: ClassGlacierIR, Size: 100}}},
 	}
 	for _, c := range cases {
 		got, err := tr.ListDirectory(c.prefix)
@@ -118,14 +118,14 @@ func TestDirectoryMarker(t *testing.T) {
 		t.Fatal(err)
 	}
 	rootEntries, _ := tr.ListDirectory("")
-	wantRoot := []Entry{{Name: "afk/", IsDir: true, Aggregate: Aggregate{Objects: 2, Bytes: ClassBytes{GlacierIR: 5}}}}
+	wantRoot := []Entry{{Name: "afk/", IsDir: true, Aggregate: Aggregate{Objects: 2, Bytes: ClassBytes{{Class: ClassGlacierIR, Size: 5}}}}}
 	if !entriesEqual(rootEntries, wantRoot) {
 		t.Fatalf("root: got %#v want %#v", rootEntries, wantRoot)
 	}
 	afkEntries, _ := tr.ListDirectory("afk/")
 	wantAfk := []Entry{
-		{Name: "", IsDir: false, Class: "STANDARD", Size: 0},
-		{Name: "file.jpg", IsDir: false, Class: "GLACIER_IR", Size: 5},
+		{Name: "", IsDir: false, Class: ClassStandard, Size: 0},
+		{Name: "file.jpg", IsDir: false, Class: ClassGlacierIR, Size: 5},
 	}
 	if !entriesEqual(afkEntries, wantAfk) {
 		t.Fatalf("afk: got %#v want %#v", afkEntries, wantAfk)
@@ -148,9 +148,9 @@ func TestIdempotentBatch(t *testing.T) {
 	}
 	got, _ := tr.ListDirectory("a/")
 	want := []Entry{
-		{Name: "b.txt", IsDir: false, Class: "STANDARD", Size: 1},
-		{Name: "c.txt", IsDir: false, Class: "STANDARD", Size: 2},
-		{Name: "d.txt", IsDir: false, Class: "STANDARD", Size: 3},
+		{Name: "b.txt", IsDir: false, Class: ClassStandard, Size: 1},
+		{Name: "c.txt", IsDir: false, Class: ClassStandard, Size: 2},
+		{Name: "d.txt", IsDir: false, Class: ClassStandard, Size: 3},
 	}
 	if !entriesEqual(got, want) {
 		t.Fatalf("got %#v want %#v", got, want)
@@ -185,8 +185,8 @@ func TestRangeDeletes(t *testing.T) {
 	}
 	got, _ := tr.ListDirectory("a/")
 	want := []Entry{
-		{Name: "b.txt", IsDir: false, Class: "STANDARD", Size: 1},
-		{Name: "d.txt", IsDir: false, Class: "STANDARD", Size: 3},
+		{Name: "b.txt", IsDir: false, Class: ClassStandard, Size: 1},
+		{Name: "d.txt", IsDir: false, Class: ClassStandard, Size: 3},
 	}
 	if !entriesEqual(got, want) {
 		t.Fatalf("got %#v want %#v", got, want)
@@ -202,12 +202,12 @@ func TestRangeUpdates(t *testing.T) {
 		t.Fatal(err)
 	}
 	got, _ := tr.ListDirectory("a/")
-	want := []Entry{{Name: "x", IsDir: false, Class: "GLACIER_IR", Size: 25}}
+	want := []Entry{{Name: "x", IsDir: false, Class: ClassGlacierIR, Size: 25}}
 	if !entriesEqual(got, want) {
 		t.Fatalf("got %#v want %#v", got, want)
 	}
 	root, _ := tr.ListDirectory("")
-	wantAgg := Aggregate{Objects: 1, Bytes: ClassBytes{GlacierIR: 25}}
+	wantAgg := Aggregate{Objects: 1, Bytes: ClassBytes{{Class: ClassGlacierIR, Size: 25}}}
 	if !aggEqual(root[0].Aggregate, wantAgg) {
 		t.Fatalf("agg: got %#v want %#v", root[0].Aggregate, wantAgg)
 	}
@@ -259,7 +259,7 @@ func loadJSONL(t testing.TB, path string) []Object {
 		if err := json.Unmarshal([]byte(line), &raw); err != nil {
 			t.Fatalf("parse: %v", err)
 		}
-		out = append(out, Object{Key: raw.Key, Size: raw.Size, Class: raw.Class})
+		out = append(out, Object{Key: raw.Key, Size: raw.Size, Class: ParseClass(raw.Class)})
 	}
 	if err := sc.Err(); err != nil {
 		t.Fatalf("scan: %v", err)
@@ -409,7 +409,7 @@ func entriesEqual(a, b []Entry) bool {
 }
 
 func aggEqual(a, b Aggregate) bool {
-	return a == b
+	return a.Equal(b)
 }
 
 func dumpEntries(e []Entry) string {
@@ -427,7 +427,7 @@ func dumpEntries(e []Entry) string {
 			nz := e[i].Aggregate.Bytes.NonZero()
 			cs := make([]string, 0, len(nz))
 			for _, kv := range nz {
-				cs = append(cs, kv.Class+"="+itoa(kv.Bytes))
+				cs = append(cs, kv.Class.String()+"="+itoa(kv.Size))
 			}
 			sort.Strings(cs)
 			b.WriteString(strings.Join(cs, ","))
@@ -436,7 +436,7 @@ func dumpEntries(e []Entry) string {
 			b.WriteString("(")
 			b.WriteString(e[i].Name)
 			b.WriteString(":")
-			b.WriteString(e[i].Class)
+			b.WriteString(e[i].Class.String())
 			b.WriteString(":")
 			b.WriteString(itoa(e[i].Size))
 			b.WriteString(")")

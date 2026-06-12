@@ -10,22 +10,29 @@ import (
 //	edge:     compressed path fragment from the parent node (empty only on root).
 //	children: sorted ascending by the first byte of their edge; Patricia
 //	          invariant guarantees each first byte is unique among siblings.
-//	file:     populated iff hasFile is true (a key terminates exactly here).
-//	agg:      recursive aggregate over the entire subtree rooted at this node.
-//
-// fileMeta is inlined rather than referenced via pointer to remove one
-// allocation per file leaf on the ingest hot path.
+//	file:     non-nil iff a key terminates exactly at this node.
+//	agg:      non-nil for nodes that have ever been internal; nil for pure
+//	          leaves whose aggregate is derived on demand (see effectiveAgg).
 type node struct {
 	edge     string
 	children []*node
-	file     fileMeta
-	hasFile  bool
-	agg      Aggregate
+	file     *ClassByte
+	agg      *Aggregate
 }
 
-type fileMeta struct {
-	Class string
-	Size  int64
+// effectiveAgg returns the aggregate over the subtree rooted at n. Pure leaves
+// (those whose agg pointer was never materialised) have their contribution
+// derived on the fly from file to keep their in-memory footprint small.
+func (n *node) effectiveAgg() Aggregate {
+	if n.agg != nil {
+		return *n.agg
+	}
+	if n.file == nil {
+		return Aggregate{}
+	}
+	a := Aggregate{Objects: 1}
+	a.Bytes.Add(n.file.Class, n.file.Size)
+	return a
 }
 
 // Tree is an in-memory compressed radix tree over S3 object keys.
@@ -159,7 +166,7 @@ func (t *Tree) ListDirectory(prefix string) ([]Entry, error) {
 // name so callers may distinguish or filter it.
 func listAtNode(n *node) []Entry {
 	out := make([]Entry, 0, len(n.children)+1)
-	if n.hasFile {
+	if n.file != nil {
 		out = append(out, Entry{
 			Name:  "",
 			IsDir: false,
@@ -182,11 +189,11 @@ func listInsideEdge(child *node, consumed string) []Entry {
 		return []Entry{{
 			Name:      residual[:i+1],
 			IsDir:     true,
-			Aggregate: child.agg,
+			Aggregate: child.effectiveAgg(),
 		}}
 	}
 	out := make([]Entry, 0, len(child.children)+1)
-	if child.hasFile {
+	if child.file != nil {
 		out = append(out, Entry{
 			Name:  residual,
 			IsDir: false,
@@ -211,11 +218,11 @@ func emitFromNode(n *node, acc string, out []Entry) []Entry {
 		return append(out, Entry{
 			Name:      acc + n.edge[:i+1],
 			IsDir:     true,
-			Aggregate: n.agg,
+			Aggregate: n.effectiveAgg(),
 		})
 	}
 	fullName := acc + n.edge
-	if n.hasFile {
+	if n.file != nil {
 		out = append(out, Entry{
 			Name:  fullName,
 			IsDir: false,
@@ -278,26 +285,27 @@ func (t *Tree) insertBatch(objs []Object) {
 
 // insert places obj into the subtree rooted at n, descending iteratively
 // until n's path equals obj.Key. n.agg is bumped on every descent step, so
-// each ancestor's aggregate is correct without a separate fix-up pass.
+// each ancestor's aggregate is correct without a separate fix-up pass. The
+// first visit to a pure leaf along the descent path materialises its agg.
 func (t *Tree) insert(n *node, key string, obj Object) {
 	for {
+		if n.agg == nil {
+			a := n.effectiveAgg()
+			n.agg = &a
+		}
 		n.agg.Objects++
 		n.agg.Bytes.Add(obj.Class, obj.Size)
 
 		if key == "" {
-			n.file = fileMeta{Class: obj.Class, Size: obj.Size}
-			n.hasFile = true
+			n.file = &ClassByte{Class: obj.Class, Size: obj.Size}
 			return
 		}
 		idx, ok := findChild(n.children, key[0])
 		if !ok {
 			leaf := &node{
-				edge:    key,
-				file:    fileMeta{Class: obj.Class, Size: obj.Size},
-				hasFile: true,
+				edge: key,
+				file: &ClassByte{Class: obj.Class, Size: obj.Size},
 			}
-			leaf.agg.Objects = 1
-			leaf.agg.Bytes.Add(obj.Class, obj.Size)
 			n.children = insertChildAt(n.children, idx, leaf)
 			return
 		}
@@ -309,22 +317,32 @@ func (t *Tree) insert(n *node, key string, obj Object) {
 			continue
 		}
 		// Split: child.edge[:lcp] is shared with key; create new intermediate.
-		intermediate := &node{edge: child.edge[:lcp], agg: child.agg}
-		intermediate.agg.Objects++
-		intermediate.agg.Bytes.Add(obj.Class, obj.Size)
+		intermediate := &node{edge: child.edge[:lcp]}
+		var a Aggregate
+		if child.agg != nil {
+			// Child is already internal; its agg.Bytes is live. Deep-copy
+			// to avoid corrupting it via the in-place Add below.
+			a.Objects = child.agg.Objects + 1
+			if n := len(child.agg.Bytes); n > 0 {
+				a.Bytes = append(make(ClassBytes, 0, n+1), child.agg.Bytes...)
+			}
+		} else {
+			// Pure leaf or empty: effectiveAgg returns a freshly constructed
+			// Aggregate, no aliasing — adopt it directly.
+			a = child.effectiveAgg()
+			a.Objects++
+		}
+		a.Bytes.Add(obj.Class, obj.Size)
+		intermediate.agg = &a
 		child.edge = child.edge[lcp:]
 		if lcp == len(key) {
-			intermediate.file = fileMeta{Class: obj.Class, Size: obj.Size}
-			intermediate.hasFile = true
+			intermediate.file = &ClassByte{Class: obj.Class, Size: obj.Size}
 			intermediate.children = []*node{child}
 		} else {
 			leaf := &node{
-				edge:    key[lcp:],
-				file:    fileMeta{Class: obj.Class, Size: obj.Size},
-				hasFile: true,
+				edge: key[lcp:],
+				file: &ClassByte{Class: obj.Class, Size: obj.Size},
 			}
-			leaf.agg.Objects = 1
-			leaf.agg.Bytes.Add(obj.Class, obj.Size)
 			intermediate.children = sortChildren(child, leaf)
 		}
 		n.children[idx] = intermediate
@@ -368,24 +386,24 @@ func (t *Tree) deleteKey(key string) {
 		rem = rem[len(child.edge):]
 		path = append(path, framePath{n: cur, consumed: consumed})
 	}
-	if !cur.hasFile {
+	if cur.file == nil {
 		return
 	}
+	// applyDelta materialises leaf aggregates via effectiveAgg(), which reads
+	// cur.file. Subtract before clearing the file pointer.
 	class, size := cur.file.Class, cur.file.Size
-	cur.file = fileMeta{}
-	cur.hasFile = false
 	applyDelta(path, class, -size, -1)
+	cur.file = nil
 
 	// Bottom-up cleanup: prune empty leaves; merge single-child no-file nodes
-	// back into a single compressed edge. Pruned nodes are not returned to the
-	// pool — chunks are append-only.
+	// back into a single compressed edge.
 	for i := len(pops) - 1; i >= 0; i-- {
 		fr := pops[i]
 		n := fr.parent.children[fr.childIdx]
 		switch {
-		case !n.hasFile && len(n.children) == 0:
+		case n.file == nil && len(n.children) == 0:
 			fr.parent.children = append(fr.parent.children[:fr.childIdx], fr.parent.children[fr.childIdx+1:]...)
-		case !n.hasFile && len(n.children) == 1:
+		case n.file == nil && len(n.children) == 1:
 			only := n.children[0]
 			only.edge = n.edge + only.edge
 			fr.parent.children[fr.childIdx] = only
@@ -417,18 +435,22 @@ func (t *Tree) updateKey(obj Object) {
 		rem = rem[len(child.edge):]
 		path = append(path, framePath{n: cur, consumed: consumed})
 	}
-	if !cur.hasFile {
+	if cur.file == nil {
 		return
 	}
 	oldClass, oldSize := cur.file.Class, cur.file.Size
-	cur.file = fileMeta{Class: obj.Class, Size: obj.Size}
+	// applyDelta lazily materialises a leaf's aggregate via effectiveAgg,
+	// which reads cur.file. The old contribution must be subtracted before
+	// the file is overwritten.
 	if oldClass == obj.Class {
 		if d := obj.Size - oldSize; d != 0 {
 			applyDelta(path, obj.Class, d, 0)
 		}
+		cur.file.Size = obj.Size
 		return
 	}
 	applyDelta(path, oldClass, -oldSize, -1)
+	cur.file = &ClassByte{Class: obj.Class, Size: obj.Size}
 	applyDelta(path, obj.Class, obj.Size, +1)
 }
 
@@ -449,10 +471,16 @@ func (t *Tree) deleteBatch(keys []string) {
 }
 
 // applyDelta walks the path from root to leaf applying the per-class byte
-// delta and the object-count delta to each node's aggregate.
-func applyDelta(path []framePath, class string, sizeDelta, objDelta int64) {
+// delta and the object-count delta to each node's aggregate. Aggregates are
+// materialised lazily — leaves that previously omitted their agg field get it
+// allocated here on first touch.
+func applyDelta(path []framePath, class StorageClass, sizeDelta, objDelta int64) {
 	for i := range path {
 		n := path[i].n
+		if n.agg == nil {
+			a := n.effectiveAgg()
+			n.agg = &a
+		}
 		n.agg.Objects += objDelta
 		if sizeDelta != 0 {
 			n.agg.Bytes.Add(class, sizeDelta)
@@ -501,7 +529,7 @@ func (rc *rangeCursor) Next() (Object, bool) {
 		top := &rc.stack[len(rc.stack)-1]
 		if !top.fileEmitted {
 			top.fileEmitted = true
-			if top.n.hasFile && top.prefix > rc.lo && top.prefix <= rc.hi {
+			if top.n.file != nil && top.prefix > rc.lo && top.prefix <= rc.hi {
 				return Object{Key: top.prefix, Size: top.n.file.Size, Class: top.n.file.Class}, true
 			}
 		}

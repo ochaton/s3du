@@ -5,11 +5,87 @@ package radix
 
 import "errors"
 
+// StorageClass enumerates the S3 storage classes returned by ListObjectsV2.
+// Encoding as a uint8 keeps per-node memory tight; ClassByte.Class is one
+// byte rather than the 16 bytes of a string header.
+type StorageClass uint8
+
+const (
+	ClassUnknown StorageClass = iota
+	ClassStandard
+	ClassStandardIA
+	ClassOneZoneIA
+	ClassIntelligentTier
+	ClassGlacierIR
+	ClassGlacier
+	ClassDeepArchive
+	ClassReducedRedundancy
+	ClassExpressOneZone
+	ClassSnow
+)
+
+// ParseClass maps an S3 storage-class string to a [StorageClass]. Unknown
+// strings (and the empty string) collapse to [ClassUnknown].
+func ParseClass(s string) StorageClass {
+	switch s {
+	case "STANDARD":
+		return ClassStandard
+	case "STANDARD_IA":
+		return ClassStandardIA
+	case "ONEZONE_IA":
+		return ClassOneZoneIA
+	case "INTELLIGENT_TIERING":
+		return ClassIntelligentTier
+	case "GLACIER_IR":
+		return ClassGlacierIR
+	case "GLACIER":
+		return ClassGlacier
+	case "DEEP_ARCHIVE":
+		return ClassDeepArchive
+	case "REDUCED_REDUNDANCY":
+		return ClassReducedRedundancy
+	case "EXPRESS_ONEZONE":
+		return ClassExpressOneZone
+	case "SNOW":
+		return ClassSnow
+	default:
+		return ClassUnknown
+	}
+}
+
+// String returns the canonical S3 identifier for c.
+func (c StorageClass) String() string {
+	switch c {
+	case ClassStandard:
+		return "STANDARD"
+	case ClassStandardIA:
+		return "STANDARD_IA"
+	case ClassOneZoneIA:
+		return "ONEZONE_IA"
+	case ClassIntelligentTier:
+		return "INTELLIGENT_TIERING"
+	case ClassGlacierIR:
+		return "GLACIER_IR"
+	case ClassGlacier:
+		return "GLACIER"
+	case ClassDeepArchive:
+		return "DEEP_ARCHIVE"
+	case ClassReducedRedundancy:
+		return "REDUCED_REDUNDANCY"
+	case ClassExpressOneZone:
+		return "EXPRESS_ONEZONE"
+	case ClassSnow:
+		return "SNOW"
+	default:
+		return "UNKNOWN"
+	}
+}
+
 // Object is a single S3 object record.
 type Object struct {
 	Key   string
 	Size  int64
-	Class string
+	Class StorageClass
 }
 
 // Batch is a contiguous range of S3 objects to ingest.
@@ -22,81 +98,50 @@ type Batch struct {
 	Objects   []Object
 }
 
-// ClassBytes accumulates byte totals per S3 storage class. Each field maps to
-// a documented S3 storage class identifier as returned by ListObjectsV2.
-// Unrecognised class strings accumulate into Other so totals remain consistent
-// without forcing a heap allocation per node.
-type ClassBytes struct {
-	Standard          int64 // "STANDARD"
-	StandardIA        int64 // "STANDARD_IA"
-	OneZoneIA         int64 // "ONEZONE_IA"
-	IntelligentTier   int64 // "INTELLIGENT_TIERING"
-	GlacierIR         int64 // "GLACIER_IR"
-	GlacierFlexible   int64 // "GLACIER"
-	DeepArchive       int64 // "DEEP_ARCHIVE"
-	ReducedRedundancy int64 // "REDUCED_REDUNDANCY"
-	ExpressOneZone    int64 // "EXPRESS_ONEZONE"
-	Snow              int64 // "SNOW"
-	Other             int64 // anything else, incl. empty string
-}
-
-// Add adds n bytes (possibly negative) to the bucket selected by class.
-func (c *ClassBytes) Add(class string, n int64) {
-	switch class {
-	case "STANDARD":
-		c.Standard += n
-	case "STANDARD_IA":
-		c.StandardIA += n
-	case "ONEZONE_IA":
-		c.OneZoneIA += n
-	case "INTELLIGENT_TIERING":
-		c.IntelligentTier += n
-	case "GLACIER_IR":
-		c.GlacierIR += n
-	case "GLACIER":
-		c.GlacierFlexible += n
-	case "DEEP_ARCHIVE":
-		c.DeepArchive += n
-	case "REDUCED_REDUNDANCY":
-		c.ReducedRedundancy += n
-	case "EXPRESS_ONEZONE":
-		c.ExpressOneZone += n
-	case "SNOW":
-		c.Snow += n
-	default:
-		c.Other += n
-	}
-}
-
-// NonZero returns the populated buckets in canonical order. Useful for
-// rendering and equality assertions.
-func (c ClassBytes) NonZero() []ClassByte {
-	out := make([]ClassByte, 0, 4)
-	for _, kv := range []ClassByte{
-		{"STANDARD", c.Standard},
-		{"STANDARD_IA", c.StandardIA},
-		{"ONEZONE_IA", c.OneZoneIA},
-		{"INTELLIGENT_TIERING", c.IntelligentTier},
-		{"GLACIER_IR", c.GlacierIR},
-		{"GLACIER", c.GlacierFlexible},
-		{"DEEP_ARCHIVE", c.DeepArchive},
-		{"REDUCED_REDUNDANCY", c.ReducedRedundancy},
-		{"EXPRESS_ONEZONE", c.ExpressOneZone},
-		{"SNOW", c.Snow},
-		{"OTHER", c.Other},
-	} {
-		if kv.Bytes != 0 {
-			out = append(out, kv)
-		}
-	}
-	return out
-}
-
-// ClassByte is a single (storage class, bytes) pair, used by ClassBytes.NonZero.
+// ClassByte is one (storage class, byte-count) pair. It does double duty: as
+// a single file's metadata (storage class + size in bytes) and as one entry
+// in a sparse aggregate over many files of the same class.
 type ClassByte struct {
-	Class string
-	Bytes int64
+	Class StorageClass
+	Size  int64
 }
+
+// ClassBytes is a sparse, unsorted accumulator keyed by [StorageClass]. The
+// number of distinct classes per node is small (S3 has roughly a dozen
+// classes, real buckets typically use 1–3), so linear scans beat ordered
+// lookups while keeping per-node memory minimal.
+type ClassBytes []ClassByte
+
+// Add adds n bytes (possibly negative) to the bucket for class. Buckets that
+// reach zero are removed; a new bucket with n == 0 is not appended.
+func (c *ClassBytes) Add(class StorageClass, n int64) {
+	s := *c
+	for i := range s {
+		if s[i].Class != class {
+			continue
+		}
+		s[i].Size += n
+		if s[i].Size == 0 {
+			*c = append(s[:i], s[i+1:]...)
+		}
+		return
+	}
+	if n == 0 {
+		return
+	}
+	*c = append(s, ClassByte{Class: class, Size: n})
+}
+
+// AddAll merges src into *c.
+func (c *ClassBytes) AddAll(src ClassBytes) {
+	for i := range src {
+		c.Add(src[i].Class, src[i].Size)
+	}
+}
+
+// NonZero returns the populated buckets. The receiver already excludes zero
+// buckets, so the return value is the slice itself.
+func (c ClassBytes) NonZero() []ClassByte { return c }
 
 // Aggregate is a recursive summary over a subtree of the radix tree.
 type Aggregate struct {
@@ -104,12 +149,32 @@ type Aggregate struct {
 	Bytes   ClassBytes
 }
 
-// Entry is one element of a ListDirectory result. Either a subdirectory (IsDir
-// true, Aggregate populated) or a direct file (IsDir false, Class+Size set).
+// Equal reports whether two aggregates carry the same data. Bytes is treated
+// as an unordered multiset since [ClassBytes.Add] does not sort.
+func (a Aggregate) Equal(b Aggregate) bool {
+	if a.Objects != b.Objects || len(a.Bytes) != len(b.Bytes) {
+		return false
+	}
+outer:
+	for i := range a.Bytes {
+		want := a.Bytes[i]
+		for j := range b.Bytes {
+			if b.Bytes[j] == want {
+				continue outer
+			}
+		}
+		return false
+	}
+	return true
+}
+
+// Entry is one element of a ListDirectory result. Either a subdirectory
+// (IsDir true, Aggregate populated) or a direct file (IsDir false, Class+Size
+// set).
 type Entry struct {
 	Name      string
 	IsDir     bool
-	Class     string
+	Class     StorageClass
 	Size      int64
 	Aggregate Aggregate
 }

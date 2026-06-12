@@ -98,7 +98,7 @@ func loadJSONL(path string) ([]radix.Object, error) {
 		if err := json.Unmarshal([]byte(line), &raw); err != nil {
 			return nil, err
 		}
-		out = append(out, radix.Object{Key: raw.Key, Size: raw.Size, Class: raw.Class})
+		out = append(out, radix.Object{Key: raw.Key, Size: raw.Size, Class: radix.ParseClass(raw.Class)})
 	}
 	return out, sc.Err()
 }
@@ -109,7 +109,7 @@ func printListing(prefix string, entries []radix.Entry) {
 		if e.IsDir {
 			fmt.Printf("  dir  %-40s objects=%d  %s\n", e.Name, e.Aggregate.Objects, classBreakdown(e.Aggregate.Bytes))
 		} else {
-			fmt.Printf("  file %-40s class=%-10s size=%d\n", e.Name, e.Class, e.Size)
+			fmt.Printf("  file %-40s class=%-10s size=%d\n", e.Name, e.Class.String(), e.Size)
 		}
 	}
 }
@@ -121,7 +121,7 @@ func classBreakdown(c radix.ClassBytes) string {
 	}
 	parts := make([]string, len(nz))
 	for i, kv := range nz {
-		parts[i] = fmt.Sprintf("%s=%d", kv.Class, kv.Bytes)
+		parts[i] = fmt.Sprintf("%s=%d", kv.Class, kv.Size)
 	}
 	return strings.Join(parts, " ")
 }
