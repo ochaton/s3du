@@ -276,78 +276,153 @@ type framePath struct {
 	consumed int
 }
 
-// insertBatch inserts a sorted, conflict-free slice of objects.
+// insertBatch inserts a sorted, conflict-free slice of objects, reusing a
+// descent path between consecutive inserts so shared key prefixes are walked
+// only once.
+//
+// The idea: a Patricia tree's ancestors of any key are exactly the nodes
+// whose edges concatenate to a prefix of that key. If two consecutive sorted
+// keys share K bytes (their longest common prefix), the first K bytes of
+// their descent paths are identical too. So after inserting the previous
+// key, the path stack already points down into the tree to where the new
+// key still agrees; we only have to pop the frames that lie *below* the
+// divergence and continue from there.
+//
+// path[0] is always the root frame so popping cannot leave the stack empty.
+// path[i].consumed is the byte-position of frame i's edge end in the
+// previous key — comparing it to lcp(prev, new) tells us how deep the new
+// key still belongs.
 func (t *Tree) insertBatch(objs []Object) {
+	path := make([]framePath, 1, 16)
+	path[0] = framePath{n: t.root, consumed: 0}
+	prevKey := ""
 	for i := range objs {
-		t.insert(t.root, objs[i].Key, objs[i])
+		obj := objs[i]
+		lcp := longestCommonPrefix(prevKey, obj.Key)
+		for len(path) > 1 && path[len(path)-1].consumed > lcp {
+			path = path[:len(path)-1]
+		}
+		path = t.insertFromPath(path, obj)
+		prevKey = obj.Key
 	}
 }
 
-// insert places obj into the subtree rooted at n, descending iteratively
-// until n's path equals obj.Key. n.agg is bumped on every descent step, so
-// each ancestor's aggregate is correct without a separate fix-up pass. The
-// first visit to a pure leaf along the descent path materialises its agg.
-func (t *Tree) insert(n *node, key string, obj Object) {
-	for {
-		if n.agg == nil {
-			a := n.effectiveAgg()
-			n.agg = &a
-		}
-		n.agg.Objects++
-		n.agg.Bytes.Add(obj.Class, obj.Size)
+// insertFromPath resumes the descent of obj.Key from the top of path. It
+// mutates the tree as needed (creating leaves, splitting compressed edges)
+// and extends path with each visited node. The returned path terminates at
+// obj's destination so the caller can reuse it for the next insert.
+//
+// Aggregate bookkeeping is top-down: obj contributes one object and Size
+// bytes to every ancestor on its descent path. The frames already in path
+// when this function runs are exactly the ancestors carried over from the
+// previous insert that are still ancestors of obj (the others were popped
+// against the LCP). We bump them once up-front, then bump each new node we
+// step into during the descent — never the same node twice.
+func (t *Tree) insertFromPath(path []framePath, obj Object) []framePath {
+	for _, f := range path {
+		bumpAgg(f.n, obj)
+	}
 
+	n := path[len(path)-1].n
+	consumed := path[len(path)-1].consumed
+	key := obj.Key[consumed:]
+
+	for {
 		if key == "" {
+			// The key terminates exactly at n; n becomes a "file leaf"
+			// (or gains its file marker if it was a pure intermediate).
+			// n.agg was already bumped via the path pre-walk.
 			n.file = &ClassByte{Class: obj.Class, Size: obj.Size}
-			return
+			return path
 		}
+
 		idx, ok := findChild(n.children, key[0])
 		if !ok {
+			// No sibling shares the next byte — attach the remainder of
+			// the key as a brand-new leaf. The leaf's own aggregate is
+			// derived on demand from its file (effectiveAgg).
 			leaf := &node{
 				edge: key,
 				file: &ClassByte{Class: obj.Class, Size: obj.Size},
 			}
 			n.children = insertChildAt(n.children, idx, leaf)
-			return
+			return append(path, framePath{n: leaf, consumed: consumed + len(key)})
 		}
+
 		child := n.children[idx]
 		lcp := longestCommonPrefix(child.edge, key)
 		if lcp == len(child.edge) {
+			// The whole edge is a prefix of the remaining key — descend
+			// into child and continue the loop one level deeper.
+			bumpAgg(child, obj)
 			n = child
+			consumed += lcp
 			key = key[lcp:]
+			path = append(path, framePath{n: n, consumed: consumed})
 			continue
 		}
-		// Split: child.edge[:lcp] is shared with key; create new intermediate.
+
+		// child.edge and key diverge after lcp bytes. Build an intermediate
+		// node carrying the shared prefix, shrink child to its remainder,
+		// and place obj either at the intermediate itself (if its key ends
+		// exactly at lcp) or as a brand-new sibling leaf.
 		intermediate := &node{edge: child.edge[:lcp]}
-		var a Aggregate
-		if child.agg != nil {
-			// Child is already internal; its agg.Bytes is live. Deep-copy
-			// to avoid corrupting it via the in-place Add below.
-			a.Objects = child.agg.Objects + 1
-			if n := len(child.agg.Bytes); n > 0 {
-				a.Bytes = append(make(ClassBytes, 0, n+1), child.agg.Bytes...)
-			}
-		} else {
-			// Pure leaf or empty: effectiveAgg returns a freshly constructed
-			// Aggregate, no aliasing — adopt it directly.
-			a = child.effectiveAgg()
-			a.Objects++
-		}
-		a.Bytes.Add(obj.Class, obj.Size)
-		intermediate.agg = &a
+		intermediate.agg = aggForSplit(child, obj)
 		child.edge = child.edge[lcp:]
+
 		if lcp == len(key) {
 			intermediate.file = &ClassByte{Class: obj.Class, Size: obj.Size}
 			intermediate.children = []*node{child}
-		} else {
-			leaf := &node{
-				edge: key[lcp:],
-				file: &ClassByte{Class: obj.Class, Size: obj.Size},
-			}
-			intermediate.children = sortChildren(child, leaf)
+			n.children[idx] = intermediate
+			return append(path, framePath{n: intermediate, consumed: consumed + lcp})
 		}
+
+		leaf := &node{
+			edge: key[lcp:],
+			file: &ClassByte{Class: obj.Class, Size: obj.Size},
+		}
+		intermediate.children = sortChildren(child, leaf)
 		n.children[idx] = intermediate
-		return
+		return append(path,
+			framePath{n: intermediate, consumed: consumed + lcp},
+			framePath{n: leaf, consumed: consumed + len(key)},
+		)
 	}
+}
+
+// bumpAgg adds obj's contribution (one object, one Size-byte entry under
+// obj.Class) to n's aggregate. If n is a pure leaf that has never carried a
+// materialised aggregate, one is allocated here from its file metadata.
+func bumpAgg(n *node, obj Object) {
+	if n.agg == nil {
+		a := n.effectiveAgg()
+		n.agg = &a
+	}
+	n.agg.Objects++
+	n.agg.Bytes.Add(obj.Class, obj.Size)
+}
+
+// aggForSplit builds the aggregate that the new intermediate produced by a
+// split should carry. It is child's existing aggregate plus one new object
+// from obj.
+//
+// If child is already internal we cannot simply alias its Bytes slice — the
+// in-place Add below would also overwrite child.agg.Bytes via the shared
+// backing. effectiveAgg returns a fresh Aggregate for pure leaves, so in
+// that case we adopt it directly without copying.
+func aggForSplit(child *node, obj Object) *Aggregate {
+	var a Aggregate
+	if child.agg != nil {
+		a.Objects = child.agg.Objects + 1
+		if k := len(child.agg.Bytes); k > 0 {
+			a.Bytes = append(make(ClassBytes, 0, k+1), child.agg.Bytes...)
+		}
+	} else {
+		a = child.effectiveAgg()
+		a.Objects++
+	}
+	a.Bytes.Add(obj.Class, obj.Size)
+	return &a
 }
 
 func sortChildren(a, b *node) []*node {
