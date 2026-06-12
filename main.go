@@ -1,3 +1,6 @@
+// s3du scans an S3 bucket and builds a compressed radix-tree index of every
+// object's key, size, and storage class. The index is snapshotted to disk
+// and can be browsed interactively via the bubbletea TUI.
 package main
 
 import (
@@ -5,190 +8,225 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"log"
 	"os"
-	"sort"
-	"strings"
+	"os/signal"
+	"path/filepath"
+	"syscall"
+	"time"
 
+	"github.com/aws/aws-sdk-go-v2/aws"
+	"github.com/aws/aws-sdk-go-v2/aws/retry"
 	"github.com/aws/aws-sdk-go-v2/config"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
+
+	"github.com/ochaton/s3du/radix"
 )
 
-var errWriter = os.Stderr
+const (
+	retryMaxAttempts = 8
+	retryMaxBackoff  = 30 * time.Second
+)
 
 func main() {
-	bucket := flag.String("bucket", "", "S3 bucket name (required)")
-	workers := flag.Int("workers", 32, "parallel worker count")
-	region := flag.String("region", "", "AWS region (default: from env/profile)")
-	interactive := flag.Bool("i", false, "launch interactive TUI after scan")
-	refresh := flag.Bool("refresh", false, "ignore cache and re-scan (use with -i)")
-	flag.Usage = func() {
-		fmt.Fprintf(os.Stderr, "Usage: s3du -bucket <name> [-workers N] [-region r] [-i] [--refresh]\n\n")
-		flag.PrintDefaults()
-	}
+	var (
+		bucket        = flag.String("bucket", "", "S3 bucket to scan (required unless -load is set)")
+		region        = flag.String("region", "", "AWS region (auto-detected when empty)")
+		endpoint      = flag.String("endpoint", "", "non-AWS S3 endpoint URL (uses path-style addressing)")
+		workers       = flag.Int("workers", 32, "number of concurrent ListObjectsV2 workers")
+		parallelDepth = flag.Int("parallel-depth", 3, "delimiter-walk depth at which prefixes become parallel work units")
+		snapshotPath  = flag.String("snapshot", "", "path to write/read the binary tree snapshot (defaults to ~/.cache/s3du/<bucket>@<region>/tree.snap)")
+		loadOnly      = flag.Bool("load", false, "skip scanning, load the snapshot from -snapshot and continue (e.g., launch TUI)")
+		interactive   = flag.Bool("i", false, "launch the bubbletea TUI after the scan finishes")
+		progressMs    = flag.Int("progress-ms", 250, "progress reporter interval in milliseconds")
+	)
 	flag.Parse()
 
-	if *bucket == "" {
-		flag.Usage()
+	if err := run(*bucket, *region, *endpoint, *workers, *parallelDepth, *snapshotPath, *loadOnly, *interactive, *progressMs); err != nil {
+		fmt.Fprintln(os.Stderr, "s3du:", err)
 		os.Exit(1)
 	}
-
-	ctx := context.Background()
-
-	cfgOpts := []func(*config.LoadOptions) error{}
-	if *region != "" {
-		cfgOpts = append(cfgOpts, config.WithRegion(*region))
-	}
-	cfg, err := config.LoadDefaultConfig(ctx, cfgOpts...)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "AWS config error: %v\n", err)
-		os.Exit(1)
-	}
-
-	client := s3.NewFromConfig(cfg)
-	bucketRegion, err := resolveBucketRegion(ctx, client, *bucket)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "cannot determine bucket region: %v\n", err)
-		os.Exit(1)
-	}
-	if bucketRegion != cfg.Region {
-		cfg, err = config.LoadDefaultConfig(ctx, append(cfgOpts, config.WithRegion(bucketRegion))...)
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "AWS config error: %v\n", err)
-			os.Exit(1)
-		}
-		client = s3.NewFromConfig(cfg)
-	}
-
-	// Try loading from cache when in interactive mode and --refresh not set.
-	if *interactive && !*refresh {
-		if cf, err := LoadStats(*bucket, bucketRegion); err == nil {
-			treeIndex, treeErr := OpenTreeIndex(*bucket, bucketRegion)
-			objIndex, objFile, objErr := OpenObjectsIndex(*bucket, bucketRegion)
-			if treeErr != nil || objErr != nil {
-				fmt.Fprintf(os.Stderr, "warning: cache incomplete (%v / %v), re-scanning\n", treeErr, objErr)
-			} else {
-				defer objFile.Close()
-				fmt.Fprintf(os.Stderr, "Loaded from cache (scanned %s, %d LIST requests)\n",
-					cf.ScannedAt.Format("2006-01-02 15:04:05"), cf.ListRequests)
-				if err := runTUI(*bucket, bucketRegion, cf.ListRequests, treeIndex, objIndex, objFile); err != nil {
-					fmt.Fprintf(os.Stderr, "TUI error: %v\n", err)
-					os.Exit(1)
-				}
-				return
-			}
-		}
-	}
-
-	// Run full scan.
-	prog := &Progress{}
-	filesChan := make(chan taggedFile, 2048)
-
-	doneProg := make(chan struct{})
-	go runProgress(prog, bucketRegion, doneProg)
-
-	cacheD, err := cacheDir(*bucket, bucketRegion)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "cache dir error: %v\n", err)
-		os.Exit(1)
-	}
-	walPath := cacheD + "/objects.wal"
-	objPath := objectsPath(cacheD)
-	treeP := treePath(cacheD)
-
-	workChan := discover(ctx, client, *bucket, filesChan, prog)
-
-	walDone := make(chan error, 1)
-	go func() { walDone <- WriteWAL(walPath, filesChan) }()
-
-	runWorkers(ctx, client, *bucket, workChan, filesChan, *workers, prog)
-	// filesChan closed by runWorkers
-
-	close(doneProg)
-
-	if err := <-walDone; err != nil {
-		fmt.Fprintf(os.Stderr, "warning: WAL write error: %v\n", err)
-	}
-
-	if err := BuildObjectsBin(walPath, objPath); err != nil {
-		fmt.Fprintf(os.Stderr, "warning: could not build objects index: %v\n", err)
-	}
-	os.Remove(walPath)
-
-	if err := BuildTreeBin(objPath, treeP); err != nil {
-		fmt.Fprintf(os.Stderr, "warning: could not build tree index: %v\n", err)
-	}
-
-	listReqs := prog.listRequests.Load()
-
-	if _, saveErr := SaveCache(*bucket, bucketRegion, listReqs); saveErr != nil {
-		fmt.Fprintf(os.Stderr, "warning: could not save cache: %v\n", saveErr)
-	}
-
-	if *interactive {
-		treeIndex, treeErr := OpenTreeIndex(*bucket, bucketRegion)
-		objIndex, objFile, objErr := OpenObjectsIndex(*bucket, bucketRegion)
-		if treeErr != nil || objErr != nil {
-			fmt.Fprintf(os.Stderr, "warning: could not open indexes: %v / %v\n", treeErr, objErr)
-		} else {
-			defer objFile.Close()
-		}
-		if err := runTUI(*bucket, bucketRegion, listReqs, treeIndex, objIndex, objFile); err != nil && !errors.Is(err, context.Canceled) {
-			fmt.Fprintf(os.Stderr, "TUI error: %v\n", err)
-			os.Exit(1)
-		}
-		return
-	}
-
-	treeIndex, err := OpenTreeIndex(*bucket, bucketRegion)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "error: could not open tree index: %v\n", err)
-		os.Exit(1)
-	}
-	printResults(treeIndex, listReqs, bucketRegion)
 }
 
-func printResults(treeIndex map[string]DirSection, listRequests int64, region string) {
-	root, ok := treeIndex[""]
-	if !ok {
-		fmt.Println("(no data)")
-		return
+func run(bucket, region, endpoint string, workers, parallelDepth int, snapshotPath string, loadOnly, interactive bool, progressMs int) error {
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+
+	// Resolve snapshot path early; both paths (scan + load) need it.
+	if snapshotPath == "" {
+		if bucket == "" {
+			return errors.New("either -bucket or -snapshot must be provided")
+		}
+		p, err := defaultSnapshotPath(bucket, region)
+		if err != nil {
+			return err
+		}
+		snapshotPath = p
 	}
 
-	// Per-storage-class summary from root.
-	scs := make([]SCSize, len(root.SCSizes))
-	copy(scs, root.SCSizes)
-	sort.Slice(scs, func(i, j int) bool { return scs[i].SC < scs[j].SC })
-	for _, s := range scs {
-		cost := monthlyStorageCost(s.Size, s.SC, region)
-		fmt.Printf("[%s]   %d files   %s   $%.4f/month\n", s.SC, s.Count, humanSize(s.Size), cost)
-	}
-	fmt.Printf("GRAND TOTAL  %d files   %s\n\n", root.Count, humanSize(root.Size))
+	var tree *radix.Tree
 
-	// Direct children of root.
-	type child struct {
-		prefix string
-		sec    DirSection
+	switch {
+	case loadOnly:
+		t, err := loadSnapshot(snapshotPath)
+		if err != nil {
+			return fmt.Errorf("load %s: %w", snapshotPath, err)
+		}
+		tree = t
+		log.Printf("loaded snapshot %s", snapshotPath)
+
+	default:
+		if bucket == "" {
+			return errors.New("-bucket is required when not using -load")
+		}
+		client, err := newS3Client(ctx, region, endpoint)
+		if err != nil {
+			return fmt.Errorf("init S3 client: %w", err)
+		}
+		// Resolve region from client config if it was auto-detected so cost
+		// calculations use the actual scan region.
+		if region == "" {
+			region = clientRegion(client)
+		}
+
+		tree = radix.New()
+		prog := NewProgress(region)
+
+		done := make(chan struct{})
+		go RunReporter(os.Stderr, prog, done, time.Duration(progressMs)*time.Millisecond)
+
+		scanner := NewScanner(client, bucket, workers, parallelDepth, tree, prog)
+		start := time.Now()
+		err = scanner.Run(ctx)
+		close(done)
+		// Give the reporter a moment to flush its final line cleanly.
+		time.Sleep(50 * time.Millisecond)
+		if err != nil {
+			return fmt.Errorf("scan: %w", err)
+		}
+		fmt.Fprintf(os.Stderr, "scan completed in %s\n", time.Since(start))
+
+		if err := saveSnapshot(snapshotPath, tree); err != nil {
+			return fmt.Errorf("save snapshot %s: %w", snapshotPath, err)
+		}
+		fmt.Fprintf(os.Stderr, "snapshot saved to %s\n", snapshotPath)
 	}
-	var children []child
-	for k, sec := range treeIndex {
-		if k == "" || strings.Count(k, "/") != 1 {
+
+	if interactive {
+		return runTUI(tree, region)
+	}
+	return printSummary(tree, region)
+}
+
+// printSummary prints the top-level directory listing along with totals when
+// the TUI is not requested.
+func printSummary(tree *radix.Tree, region string) error {
+	entries, err := tree.ListDirectory("")
+	if err != nil {
+		return err
+	}
+	if len(entries) == 0 {
+		fmt.Println("(empty tree)")
+		return nil
+	}
+	fmt.Printf("%-40s %12s %15s %12s\n", "name", "objects", "bytes", "$/month")
+	for _, e := range entries {
+		if e.IsDir {
+			cost := 0.0
+			for _, kv := range e.Aggregate.Bytes {
+				cost += monthlyStorageCost(kv.Size, kv.Class.String(), region)
+			}
+			fmt.Printf("%-40s %12d %15s %12s\n", e.Name, e.Aggregate.Objects, humanBytes(byteSum(e.Aggregate.Bytes)), humanDollars(cost))
 			continue
 		}
-		children = append(children, child{k, sec})
+		fmt.Printf("%-40s %12s %15s %12s\n", e.Name, "(file)", humanBytes(e.Size), humanDollars(monthlyStorageCost(e.Size, e.Class.String(), region)))
 	}
-	sort.Slice(children, func(i, j int) bool { return children[i].sec.Size > children[j].sec.Size })
+	return nil
+}
 
-	if len(children) > 0 {
-		fmt.Println("Top-level directories:")
-		for _, c := range children {
-			cost := c.sec.monthlyCost(region)
-			fmt.Printf("  %-40s  %d files   %s   $%.4f/month\n",
-				c.prefix, c.sec.Count, humanSize(c.sec.Size), cost)
+func byteSum(b radix.ClassBytes) int64 {
+	var t int64
+	for _, kv := range b {
+		t += kv.Size
+	}
+	return t
+}
+
+// defaultSnapshotPath returns ~/.cache/s3du/<bucket>@<region>/tree.snap.
+func defaultSnapshotPath(bucket, region string) (string, error) {
+	dir, err := os.UserCacheDir()
+	if err != nil {
+		return "", err
+	}
+	if region == "" {
+		region = "unknown"
+	}
+	return filepath.Join(dir, "s3du", bucket+"@"+region, "tree.snap"), nil
+}
+
+// saveSnapshot writes tree to path, creating parent directories.
+func saveSnapshot(path string, tree *radix.Tree) error {
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		return err
+	}
+	tmp := path + ".tmp"
+	f, err := os.Create(tmp)
+	if err != nil {
+		return err
+	}
+	if err := tree.Save(f); err != nil {
+		_ = f.Close()
+		_ = os.Remove(tmp)
+		return err
+	}
+	if err := f.Close(); err != nil {
+		_ = os.Remove(tmp)
+		return err
+	}
+	return os.Rename(tmp, path)
+}
+
+// loadSnapshot reads a previously saved tree from path.
+func loadSnapshot(path string) (*radix.Tree, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+	return radix.Load(f)
+}
+
+func newS3Client(ctx context.Context, region, endpoint string) (*s3.Client, error) {
+	loaders := []func(*config.LoadOptions) error{
+		config.WithRetryer(func() aws.Retryer {
+			return retry.NewAdaptiveMode(func(o *retry.AdaptiveModeOptions) {
+				o.StandardOptions = append(o.StandardOptions,
+					func(so *retry.StandardOptions) {
+						so.MaxAttempts = retryMaxAttempts
+						so.MaxBackoff = retryMaxBackoff
+					})
+			})
+		}),
+	}
+	if region != "" {
+		loaders = append(loaders, config.WithRegion(region))
+	}
+	cfg, err := config.LoadDefaultConfig(ctx, loaders...)
+	if err != nil {
+		return nil, err
+	}
+	return s3.NewFromConfig(cfg, func(opt *s3.Options) {
+		if endpoint != "" {
+			opt.BaseEndpoint = aws.String(endpoint)
+			opt.UsePathStyle = true
 		}
-		fmt.Println()
-	}
+	}), nil
+}
 
-	pricePerK := listCostForRegion(region)
-	listCost := computeCost(listRequests, region)
-	fmt.Printf("LIST run: %d requests @ $%.4f/1k = $%.6f\n", listRequests, pricePerK, listCost)
+// clientRegion returns the region the s3.Client is configured with, or "".
+func clientRegion(c *s3.Client) string {
+	// The SDK exposes the region only on Options; capture it via a no-op
+	// Options mutator just before returning the client. Easier path: read it
+	// from the SDK helper.
+	return c.Options().Region
 }

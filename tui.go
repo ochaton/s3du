@@ -2,369 +2,279 @@ package main
 
 import (
 	"fmt"
-	"os"
-	"sort"
 	"strings"
 
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
+
+	"github.com/ochaton/s3du/radix"
 )
 
-// styles
-var (
-	styleHeader   = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("33"))
-	styleSelected = lipgloss.NewStyle().Reverse(true)
-	styleDim      = lipgloss.NewStyle().Faint(true)
-	styleSep      = lipgloss.NewStyle().Foreground(lipgloss.Color("240"))
-	styleFooter   = lipgloss.NewStyle().Faint(true)
-	styleCost     = lipgloss.NewStyle().Foreground(lipgloss.Color("214"))
-	styleDir      = lipgloss.NewStyle().Foreground(lipgloss.Color("39"))
-)
-
-type DirEntry struct {
-	name        string // display name (basename for files, last segment for dirs)
-	fullPrefix  string // full prefix for dirs (used for navigation); full key for files (unused)
-	isDir       bool
-	count       int64
-	size        int64
-	monthlyCost float64
+// runTUI launches the bubbletea browser over an already-built radix.Tree.
+func runTUI(tree *radix.Tree, region string) error {
+	_, err := tea.NewProgram(initialModel(tree, region), tea.WithAltScreen()).Run()
+	return err
 }
 
+// tuiModel drives the radix-tree browser. It holds no derived state across
+// renders that ListDirectory cannot cheaply recompute, so navigation is just
+// a stack of prefix strings.
 type tuiModel struct {
-	bucket       string
-	region       string
-	treeIndex    map[string]DirSection
-	listRequests int64
-
-	objIndex map[string]ObjectSection
-	objFile  *os.File
-
-	currentPrefix string
-	cursor        int
-	entries       []DirEntry
-	cursorHistory map[string]int
-
-	showHelp bool
-	width    int
-	height   int
+	tree    *radix.Tree
+	region  string
+	width   int
+	height  int
+	prefix  string             // current directory prefix ("" for root)
+	stack   []navFrame         // ancestry from root to prefix exclusive
+	entries []radix.Entry      // listing of prefix; recomputed on navigation
+	cursor  int                // selected entry index
+	err     error              // last navigation error, if any
 }
 
-func newTUIModel(bucket, region string, listRequests int64, treeIndex map[string]DirSection, objIndex map[string]ObjectSection, objFile *os.File) tuiModel {
-	m := tuiModel{
-		bucket:        bucket,
-		region:        region,
-		treeIndex:     treeIndex,
-		listRequests:  listRequests,
-		objIndex:      objIndex,
-		objFile:       objFile,
-		currentPrefix: "",
-		cursorHistory: make(map[string]int),
-		width:         80,
-		height:        24,
-	}
-	m.entries = m.computeEntries(m.currentPrefix)
+// navFrame remembers the cursor position at each ancestor so going back
+// restores the user's place.
+type navFrame struct {
+	prefix string
+	cursor int
+}
+
+func initialModel(tree *radix.Tree, region string) *tuiModel {
+	m := &tuiModel{tree: tree, region: region}
+	m.reload()
 	return m
 }
 
-// computeEntries builds the display list for currentPrefix.
-// Directories come from treeIndex (in memory). Files loaded lazily from objects.bin.
-func (m *tuiModel) computeEntries(currentPrefix string) []DirEntry {
-	entries := make([]DirEntry, 0, 32)
-
-	if currentPrefix != "" {
-		entries = append(entries, DirEntry{name: "..", isDir: true})
+// reload fetches the current prefix's listing into m.entries.
+func (m *tuiModel) reload() {
+	entries, err := m.tree.ListDirectory(m.prefix)
+	if err != nil {
+		m.err = err
+		m.entries = nil
+		return
 	}
-
-	for k, sec := range m.treeIndex {
-		if !strings.HasPrefix(k, currentPrefix) {
-			continue
-		}
-		rel := k[len(currentPrefix):]
-		if rel == "" {
-			continue
-		}
-		// Direct child: rel is "something/" with exactly one slash.
-		if strings.Count(rel, "/") != 1 {
-			continue
-		}
-		entries = append(entries, DirEntry{
-			name:        lastSegment(k),
-			fullPrefix:  k,
-			isDir:       true,
-			count:       sec.Count,
-			size:        sec.Size,
-			monthlyCost: sec.monthlyCost(m.region),
-		})
+	m.err = nil
+	m.entries = entries
+	if m.cursor >= len(entries) {
+		m.cursor = max0(len(entries) - 1)
 	}
-
-	// Load files for this prefix from disk (only those directly here).
-	files := m.loadFiles(currentPrefix)
-	for _, fe := range files {
-		cost := monthlyStorageCost(fe.SizeBytes, fe.StorageClass, m.region)
-		entries = append(entries, DirEntry{
-			name:        fe.Name,
-			isDir:       false,
-			count:       1,
-			size:        fe.SizeBytes,
-			monthlyCost: cost,
-		})
-	}
-
-	sort.SliceStable(entries, func(i, j int) bool {
-		if entries[i].name == ".." {
-			return true
-		}
-		if entries[j].name == ".." {
-			return false
-		}
-		if entries[i].isDir != entries[j].isDir {
-			return entries[i].isDir
-		}
-		return entries[i].size > entries[j].size
-	})
-
-	return entries
 }
 
-func (m *tuiModel) loadFiles(prefix string) []FileEntry {
-	if m.objFile == nil || m.objIndex == nil {
-		return nil
+func max0(n int) int {
+	if n < 0 {
+		return 0
 	}
-	files, _ := ReadFilesForPrefix(m.objFile, m.objIndex, prefix)
-	return files
+	return n
 }
 
-func (m tuiModel) Init() tea.Cmd {
-	return nil
-}
+func (m *tuiModel) Init() tea.Cmd { return nil }
 
-func (m tuiModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
+func (m *tuiModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch msg := msg.(type) {
 	case tea.WindowSizeMsg:
 		m.width = msg.Width
 		m.height = msg.Height
-		return m, nil
-
 	case tea.KeyMsg:
 		switch msg.String() {
 		case "q", "ctrl+c":
 			return m, tea.Quit
-
-		case "?":
-			m.showHelp = !m.showHelp
-			return m, nil
-
 		case "up", "k":
 			if m.cursor > 0 {
 				m.cursor--
 			}
-
 		case "down", "j":
 			if m.cursor < len(m.entries)-1 {
 				m.cursor++
 			}
-
-		case "pgup", "ctrl+b":
-			m.cursor -= m.pageSize()
-			if m.cursor < 0 {
-				m.cursor = 0
-			}
-
-		case "pgdn", "ctrl+f":
-			m.cursor += m.pageSize()
+		case "home", "g":
+			m.cursor = 0
+		case "end", "G":
+			m.cursor = max0(len(m.entries) - 1)
+		case "pgup":
+			m.cursor = max0(m.cursor - m.pageStep())
+		case "pgdown":
+			m.cursor = m.cursor + m.pageStep()
 			if m.cursor >= len(m.entries) {
-				m.cursor = len(m.entries) - 1
+				m.cursor = max0(len(m.entries) - 1)
 			}
-
 		case "enter", "right", "l":
-			if m.cursor < len(m.entries) {
-				sel := m.entries[m.cursor]
-				if sel.name == ".." {
-					m = m.goUp()
-				} else if sel.isDir {
-					m.cursorHistory[m.currentPrefix] = m.cursor
-					m.currentPrefix = sel.fullPrefix
-					m.entries = m.computeEntries(m.currentPrefix)
-					m.cursor = m.cursorHistory[m.currentPrefix]
-					if m.cursor >= len(m.entries) {
-						m.cursor = 0
-					}
-				}
-			}
-
+			m.descend()
 		case "backspace", "left", "h":
-			if m.currentPrefix != "" {
-				m = m.goUp()
-			}
+			m.ascend()
 		}
 	}
 	return m, nil
 }
 
-func (m tuiModel) pageSize() int {
-	ps := m.height - 6
-	if ps < 1 {
-		ps = 1
+func (m *tuiModel) pageStep() int {
+	if m.height < 6 {
+		return 1
 	}
-	return ps
+	return m.height - 4
 }
 
-func (m tuiModel) goUp() tuiModel {
-	parent := parentPrefix(m.currentPrefix)
-	m.cursorHistory[m.currentPrefix] = m.cursor
-	prevCursor := m.cursorHistory[parent]
-	m.currentPrefix = parent
-	m.entries = m.computeEntries(m.currentPrefix)
-	m.cursor = prevCursor
+func (m *tuiModel) descend() {
 	if m.cursor >= len(m.entries) {
-		m.cursor = 0
+		return
 	}
-	return m
+	e := m.entries[m.cursor]
+	if !e.IsDir {
+		return
+	}
+	m.stack = append(m.stack, navFrame{prefix: m.prefix, cursor: m.cursor})
+	m.prefix = m.prefix + e.Name
+	m.cursor = 0
+	m.reload()
 }
 
-func parentPrefix(prefix string) string {
+func (m *tuiModel) ascend() {
+	if len(m.stack) == 0 {
+		return
+	}
+	last := m.stack[len(m.stack)-1]
+	m.stack = m.stack[:len(m.stack)-1]
+	m.prefix = last.prefix
+	m.cursor = last.cursor
+	m.reload()
+}
+
+// Styling.
+var (
+	headerStyle    = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("12"))
+	selectedStyle  = lipgloss.NewStyle().Foreground(lipgloss.Color("0")).Background(lipgloss.Color("12"))
+	dirStyle       = lipgloss.NewStyle().Foreground(lipgloss.Color("12"))
+	dimStyle       = lipgloss.NewStyle().Foreground(lipgloss.Color("8"))
+	errStyle       = lipgloss.NewStyle().Foreground(lipgloss.Color("9"))
+	footerHelpHint = "↑/↓ move · Enter/l descend · Backspace/h up · q quit"
+)
+
+func (m *tuiModel) View() string {
+	var b strings.Builder
+	prefix := m.prefix
 	if prefix == "" {
-		return ""
+		prefix = "/"
 	}
-	trimmed := strings.TrimSuffix(prefix, "/")
-	idx := strings.LastIndex(trimmed, "/")
-	if idx < 0 {
-		return ""
+	b.WriteString(headerStyle.Render(fmt.Sprintf("s3du · %s · %s", m.region, prefix)))
+	b.WriteString("\n\n")
+
+	if m.err != nil {
+		b.WriteString(errStyle.Render("error: " + m.err.Error()))
+		b.WriteString("\n")
+		return b.String()
 	}
-	return trimmed[:idx+1]
-}
-
-func (m tuiModel) View() string {
-	if m.showHelp {
-		return m.helpView()
-	}
-
-	var sb strings.Builder
-
-	path := "s3://" + m.bucket + "/" + m.currentPrefix
-	header := styleHeader.Render(fmt.Sprintf(" s3du  %-*s  %s", m.width-20, path, m.region))
-	sb.WriteString(header + "\n")
-	sb.WriteString(styleSep.Render(strings.Repeat("─", m.width)) + "\n")
-
-	sizeW := 10
-	objW := 9
-	costW := 10
-	nameW := m.width - sizeW - objW - costW - 6
-	if nameW < 10 {
-		nameW = 10
+	if len(m.entries) == 0 {
+		b.WriteString(dimStyle.Render("(empty directory)"))
+		b.WriteString("\n\n")
+		b.WriteString(dimStyle.Render(footerHelpHint))
+		return b.String()
 	}
 
-	colHdr := fmt.Sprintf("  %*s  %*s  %*s  %-s",
-		sizeW, "Size",
-		objW, "Objects",
-		costW, "$/month",
-		"Name",
-	)
-	sb.WriteString(styleDim.Render(colHdr) + "\n")
-
-	listHeight := m.height - 6
-	if listHeight < 1 {
-		listHeight = 1
+	// Layout: pad name column to width; rest is fixed-width metrics.
+	nameWidth := m.width - 50
+	if nameWidth < 20 {
+		nameWidth = 20
 	}
 
-	start := 0
-	if m.cursor >= listHeight {
-		start = m.cursor - listHeight + 1
-	}
-	end := start + listHeight
-	if end > len(m.entries) {
-		end = len(m.entries)
-	}
-
-	for i := start; i < end; i++ {
+	// Body rows.
+	startRow, endRow := visibleRange(m.cursor, m.height-5, len(m.entries))
+	for i := startRow; i < endRow; i++ {
 		e := m.entries[i]
-		var line string
-		if e.name == ".." {
-			line = fmt.Sprintf("  %*s  %*s  %*s  %s",
-				sizeW, "", objW, "", costW, "",
-				styleDir.Render(".."),
-			)
-		} else {
-			var nameStr string
-			if e.isDir {
-				nameStr = styleDir.Render(e.name)
-			} else {
-				nameStr = e.name
-			}
-			if len(nameStr) > nameW {
-				nameStr = nameStr[:nameW-1] + "…"
-			}
-			costStr := fmt.Sprintf("$%.4f", e.monthlyCost)
-			line = fmt.Sprintf("  %*s  %*d  %*s  %s",
-				sizeW, humanSize(e.size),
-				objW, e.count,
-				costW, costStr,
-				nameStr,
-			)
-		}
+		line := renderRow(e, m.region, nameWidth)
 		if i == m.cursor {
-			line = styleSelected.Render(line)
+			line = selectedStyle.Render(line)
+		} else if e.IsDir {
+			line = dirStyle.Render(line)
 		}
-		sb.WriteString(line + "\n")
+		b.WriteString(line)
+		b.WriteString("\n")
 	}
 
-	for i := end - start; i < listHeight; i++ {
-		sb.WriteString("\n")
+	// Status line: total + cost for the current directory.
+	totalObj, totalBytes, totalCost := dirTotals(m.entries, m.region)
+	b.WriteString("\n")
+	b.WriteString(dimStyle.Render(fmt.Sprintf("total: %d objects · %s · %s/mo",
+		totalObj, humanBytes(totalBytes), humanDollars(totalCost))))
+	b.WriteString("\n")
+	b.WriteString(dimStyle.Render(footerHelpHint))
+	return b.String()
+}
+
+// visibleRange returns the inclusive-exclusive index range that fits in
+// rows display rows while keeping cursor visible.
+func visibleRange(cursor, rows, total int) (int, int) {
+	if rows < 1 {
+		rows = 1
 	}
+	if total <= rows {
+		return 0, total
+	}
+	half := rows / 2
+	start := cursor - half
+	if start < 0 {
+		start = 0
+	}
+	end := start + rows
+	if end > total {
+		end = total
+		start = end - rows
+	}
+	return start, end
+}
 
-	sb.WriteString(styleSep.Render(strings.Repeat("─", m.width)) + "\n")
+func renderRow(e radix.Entry, region string, nameWidth int) string {
+	name := e.Name
+	if e.IsDir {
+		// indicate dir with trailing slash (already in radix.Entry for dirs).
+	} else {
+		// nothing to add; file rows render their class/size.
+	}
+	if len(name) > nameWidth {
+		name = name[:nameWidth-1] + "…"
+	}
+	if e.IsDir {
+		bytes := byteSum(e.Aggregate.Bytes)
+		cost := dirCost(e.Aggregate.Bytes, region)
+		return fmt.Sprintf("%-*s  %10d  %10s  %10s",
+			nameWidth, name,
+			e.Aggregate.Objects,
+			humanBytes(bytes),
+			humanDollars(cost),
+		)
+	}
+	cost := monthlyStorageCost(e.Size, e.Class.String(), region)
+	return fmt.Sprintf("%-*s  %10s  %10s  %10s",
+		nameWidth, name,
+		e.Class.String(),
+		humanBytes(e.Size),
+		humanDollars(cost),
+	)
+}
 
-	var totalCount, totalSize int64
-	var totalCost float64
-	for _, e := range m.entries {
-		if e.name != ".." {
-			totalCount += e.count
-			totalSize += e.size
-			totalCost += e.monthlyCost
+// dirCost sums the monthly storage cost for an aggregate's ClassBytes.
+func dirCost(b radix.ClassBytes, region string) float64 {
+	var total float64
+	for _, kv := range b {
+		total += monthlyStorageCost(kv.Size, kv.Class.String(), region)
+	}
+	return total
+}
+
+// dirTotals collapses a listing's entries into totals for the status line.
+func dirTotals(entries []radix.Entry, region string) (int64, int64, float64) {
+	var (
+		objs  int64
+		bytes int64
+		cost  float64
+	)
+	for _, e := range entries {
+		if e.IsDir {
+			objs += e.Aggregate.Objects
+			bytes += byteSum(e.Aggregate.Bytes)
+			cost += dirCost(e.Aggregate.Bytes, region)
+			continue
 		}
+		objs++
+		bytes += e.Size
+		cost += monthlyStorageCost(e.Size, e.Class.String(), region)
 	}
-	listCost := computeCost(m.listRequests, m.region)
-	footer1 := fmt.Sprintf(" Total: %s  %d objects  Monthly: %s",
-		humanSize(totalSize), totalCount, styleCost.Render(fmt.Sprintf("$%.4f", totalCost)))
-	footer2 := styleFooter.Render(fmt.Sprintf(" LIST run: %d requests  $%.6f  [↑↓/jk] move  [PgUp/Dn] page  [↵/→/l] enter  [←/h/bksp] back  [q]uit  [?]help",
-		m.listRequests, listCost))
-	sb.WriteString(footer1 + "\n")
-	sb.WriteString(footer2)
-
-	return sb.String()
-}
-
-func (m tuiModel) helpView() string {
-	help := []string{
-		"",
-		"  s3du — keyboard shortcuts",
-		"",
-		"  ↑ / k            move up",
-		"  ↓ / j            move down",
-		"  PgUp / Ctrl+B    page up",
-		"  PgDn / Ctrl+F    page down",
-		"  Enter / → / l    enter directory",
-		"  Backspace / ← / h  go up",
-		"  q / Ctrl-C       quit",
-		"  ?                toggle this help",
-		"",
-		"  Press any key to close",
-	}
-	return strings.Join(help, "\n")
-}
-
-func lastSegment(prefix string) string {
-	trimmed := strings.TrimSuffix(prefix, "/")
-	idx := strings.LastIndex(trimmed, "/")
-	if idx < 0 {
-		return prefix
-	}
-	return trimmed[idx+1:] + "/"
-}
-
-func runTUI(bucket, region string, listRequests int64, treeIndex map[string]DirSection, objIndex map[string]ObjectSection, objFile *os.File) error {
-	m := newTUIModel(bucket, region, listRequests, treeIndex, objIndex, objFile)
-	p := tea.NewProgram(m, tea.WithAltScreen())
-	_, err := p.Run()
-	return err
+	return objs, bytes, cost
 }
