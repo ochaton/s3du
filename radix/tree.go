@@ -36,6 +36,14 @@ func (n *node) effectiveAgg() Aggregate {
 	return a
 }
 
+// RootAggregate returns the aggregate over the whole tree (the radix root's
+// aggregate). O(1) — the aggregate is maintained incrementally on every
+// insert. Callers that just need the total object count or the per-class
+// bytes should use this instead of walking Export.
+func (t *Tree) RootAggregate() Aggregate {
+	return t.at(rootID).effectiveAgg()
+}
+
 // Tree is an in-memory compressed radix tree over S3 object keys.
 //
 // Nodes live in a chunked arena (Tree.chunks). Each chunk is a fixed-size

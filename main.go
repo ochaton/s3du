@@ -101,8 +101,7 @@ func acquireTree(ctx context.Context, o *opts) (*radix.Tree, error) {
 		if err != nil {
 			return nil, fmt.Errorf("load %s: %w", o.snapshotPath, err)
 		}
-		nObjs := countTreeObjects(tree)
-		reportHeap("loaded snapshot", nObjs)
+		reportHeap("loaded snapshot", tree.RootAggregate().Objects)
 		return tree, nil
 	}
 
@@ -165,14 +164,6 @@ func acquireTree(ctx context.Context, o *opts) (*radix.Tree, error) {
 	return tree, nil
 }
 
-// countTreeObjects walks the loaded tree to recover the object count for
-// reporting. Tree.Export iterates leaves in lex order; counting is a
-// constant-time-per-leaf walk over already-resident memory.
-func countTreeObjects(tree *radix.Tree) int64 {
-	var n int64
-	tree.Export(func(radix.Object) bool { n++; return true })
-	return n
-}
 
 // printRootListing prints the top-level directory listing along with per-
 // directory totals when the TUI is not requested. Distinct from the scan-
