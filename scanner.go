@@ -20,72 +20,75 @@ import (
 // avoid one *string allocation per paginator init.
 var slashStr = aws.String("/")
 
+// workQueueCapacity bounds the in-flight queue. Sized for worst-case fan-out:
+// the deepest layer can briefly hold every just-discovered sub-prefix. At
+// 32 workers and ~10³ branching factor per probe, 64 K is comfortable.
+const workQueueCapacity = 65536
+
 // Scanner walks an S3 bucket and ingests every object into a radix.Tree.
 //
-// The pipeline has three stages connected by channels:
+// One unified worker pool processes a single queue of work items. Each item
+// is (prefix, depth):
 //
-//  1. discover — one goroutine. Walks the bucket using delimiter='/' down
-//     to parallelDepth, emitting "leaf" prefixes (deep enough to be worth
-//     parallelising) into workQ. At each level it also emits the directly
-//     visible files (Contents) as batches so files lying above the leaf
-//     depth are not missed.
+//   - depth >= maxDepth → paginated recursive ListObjectsV2 (no delimiter)
+//     emits every page as a radix.Batch and exits.
+//   - depth < maxDepth → probe ListObjectsV2 with delimiter='/'. Each
+//     page's Contents go out as a batch; each CommonPrefix is enqueued
+//     back as a new work item one level deeper.
 //
-//  2. workers — N goroutines. Each pulls a leaf prefix from workQ and does
-//     a paginated, recursive ListObjectsV2 (no delimiter) over that prefix.
-//     Every page becomes one radix.Batch sent to batchQ.
+// Self-balancing: a worker that picks up a huge prefix probes it, finds
+// its branching structure, and fans the sub-prefixes back into the queue.
+// The idle workers pick up those sub-prefixes — no long-tail collapse.
 //
-//  3. writer — one goroutine. Drains batchQ and calls tree.AddBatch. Single
-//     consumer ⇒ no mutex needed around the tree.
+// Termination: a single atomic counter tracks queued-but-unprocessed items.
+// Each enqueue increments BEFORE send; each worker decrements AFTER process
+// (after any sub-enqueues it makes have completed their Add). The worker
+// whose decrement drops the counter to zero closes a `done` channel;
+// siblings observe done in select and exit.
 //
-// On any goroutine returning a non-nil error, Scanner cancels the shared
-// context so the other stages observe ctx.Done() and unwind promptly;
-// without that, a worker error would leave the buffered workQ filling up
-// and deadlock discover's send.
-//
-// Why no key overlap across workers:
-//   - parallelDepth leaf prefixes are mutually exclusive (each is a distinct
-//     branch of the delimiter walk).
-//   - discover's intermediate-level Contents are at depths strictly above
-//     parallelDepth and never overlap any worker's scan.
-//   - Within a worker's prefix scan, pages are sequentially non-overlapping
-//     and the AddBatch StartFrom contract is satisfied page-to-page.
-//   - Across workers, each batch's lex range is contained in its own prefix's
-//     subtree; AddBatch's cursor finds nothing in other workers' ranges.
+// No key overlap concerns: sub-prefixes returned by a delimiter probe are
+// mutually exclusive byte ranges. Per-batch StartFrom is the prefix with
+// any trailing '/' stripped, which is strictly less than every key in the
+// batch and strictly greater than any key in any sibling prefix.
 type Scanner struct {
-	s3            *s3.Client
-	bucket        string
-	parallelDepth int
-	workers       int
+	s3       *s3.Client
+	bucket   string
+	maxDepth int
+	workers  int
 
 	tree     *radix.Tree
 	progress *Progress
 
-	// firstErr captures the first error reported by any goroutine. It is
-	// set via CompareAndSwap so writers race-free and reads see a stable
-	// value once Wait completes.
+	// firstErr captures the first error reported by any goroutine. Set via
+	// CompareAndSwap so writers stay race-free; reads see a stable value
+	// once Wait completes.
 	firstErr atomic.Pointer[error]
 	cancel   context.CancelFunc
 
 	ran atomic.Bool // guards against repeat Run calls
 }
 
+// workItem is one prefix scheduled for either probing or recursive scanning.
+type workItem struct {
+	prefix string
+	depth  int
+}
+
 // NewScanner constructs a Scanner. The caller owns tree and progress.
-func NewScanner(client *s3.Client, bucket string, workers, parallelDepth int, tree *radix.Tree, progress *Progress) *Scanner {
+func NewScanner(client *s3.Client, bucket string, workers, maxDepth int, tree *radix.Tree, progress *Progress) *Scanner {
 	return &Scanner{
-		s3:            client,
-		bucket:        bucket,
-		parallelDepth: parallelDepth,
-		workers:       workers,
-		tree:          tree,
-		progress:      progress,
+		s3:       client,
+		bucket:   bucket,
+		maxDepth: maxDepth,
+		workers:  workers,
+		tree:     tree,
+		progress: progress,
 	}
 }
 
-// Run starts the discover/worker/writer goroutines and blocks until all
-// stages drain. The first error from any goroutine is returned and the
-// shared context is cancelled so the remaining stages exit promptly.
-//
-// Run is single-use: subsequent calls panic.
+// Run starts the worker pool and writer goroutine, seeds the root prefix,
+// and blocks until every queued item has been processed (or the context
+// has been cancelled by an error). Single-use; subsequent calls panic.
 func (s *Scanner) Run(ctx context.Context) error {
 	if !s.ran.CompareAndSwap(false, true) {
 		panic("radix: Scanner.Run called more than once; construct a fresh Scanner")
@@ -93,12 +96,24 @@ func (s *Scanner) Run(ctx context.Context) error {
 	ctx, s.cancel = context.WithCancel(ctx)
 	defer s.cancel()
 
-	// Channels are local to Run; owning them on the struct invites misuse
-	// from callers that hold a Scanner reference.
-	workQ := make(chan string, 1024)
+	workQ := make(chan workItem, workQueueCapacity)
 	batchQ := make(chan radix.Batch, 256)
+	done := make(chan struct{})
 
-	var wgWriter, wgWorkers, wgDiscover sync.WaitGroup
+	var pending atomic.Int64
+
+	enqueue := func(item workItem) bool {
+		pending.Add(1)
+		select {
+		case workQ <- item:
+			return true
+		case <-ctx.Done():
+			pending.Add(-1)
+			return false
+		}
+	}
+
+	var wgWriter, wgWorkers sync.WaitGroup
 
 	wgWriter.Go(func() {
 		for b := range batchQ {
@@ -121,12 +136,14 @@ func (s *Scanner) Run(ctx context.Context) error {
 				select {
 				case <-ctx.Done():
 					return
-				case prefix, ok := <-workQ:
-					if !ok {
-						return
+				case <-done:
+					return
+				case item := <-workQ:
+					if err := s.processItem(ctx, item, enqueue, batchQ); err != nil {
+						s.recordErr(fmt.Errorf("process %q: %w", item.prefix, err))
 					}
-					if err := s.listRecursive(ctx, batchQ, prefix); err != nil {
-						s.recordErr(fmt.Errorf("listRecursive %q: %w", prefix, err))
+					if pending.Add(-1) == 0 {
+						close(done)
 						return
 					}
 				}
@@ -134,14 +151,11 @@ func (s *Scanner) Run(ctx context.Context) error {
 		})
 	}
 
-	wgDiscover.Go(func() {
-		if err := s.discover(ctx, workQ, batchQ, "", 0); err != nil {
-			s.recordErr(fmt.Errorf("discover: %w", err))
-		}
-	})
+	if !enqueue(workItem{prefix: "", depth: 0}) {
+		// ctx cancelled before the seed landed; workers will exit via
+		// ctx.Done and the writer below.
+	}
 
-	wgDiscover.Wait()
-	close(workQ)
 	wgWorkers.Wait()
 	close(batchQ)
 	wgWriter.Wait()
@@ -155,33 +169,32 @@ func (s *Scanner) Run(ctx context.Context) error {
 	return nil
 }
 
-// discover walks the bucket with delimiter='/' down to parallelDepth. At
-// each level it forwards Contents as batches and recurses into
-// CommonPrefixes. At parallelDepth it enqueues the prefix for the workers.
-func (s *Scanner) discover(ctx context.Context, workQ chan<- string, batchQ chan<- radix.Batch, prefix string, depth int) error {
-	slog.Debug("discover", "prefix", prefix, "depth", depth)
-	if depth >= s.parallelDepth {
-		select {
-		case <-ctx.Done():
-			return ctx.Err()
-		case workQ <- prefix:
-		}
-		return nil
+// processItem dispatches one work item to either the recursive scanner
+// (at the depth cap) or the delimiter-probe routine.
+func (s *Scanner) processItem(ctx context.Context, item workItem, enqueue func(workItem) bool, batchQ chan<- radix.Batch) error {
+	if item.depth >= s.maxDepth {
+		return s.listRecursive(ctx, batchQ, item.prefix)
 	}
+	return s.probeAndFanOut(ctx, item, enqueue, batchQ)
+}
 
+// probeAndFanOut lists item.prefix with delimiter='/', emits every page's
+// Contents as a batch, and enqueues each discovered CommonPrefix one level
+// deeper. Returns once every page has been consumed and every sub-prefix
+// has been queued (enqueue is synchronous up to workQ buffer).
+func (s *Scanner) probeAndFanOut(ctx context.Context, item workItem, enqueue func(workItem) bool, batchQ chan<- radix.Batch) error {
+	slog.Debug("probe", "prefix", item.prefix, "depth", item.depth)
 	p := s3.NewListObjectsV2Paginator(s.s3, &s3.ListObjectsV2Input{
 		Bucket:    aws.String(s.bucket),
-		Prefix:    aws.String(prefix),
+		Prefix:    aws.String(item.prefix),
 		Delimiter: slashStr,
 	})
-	// First page's StartFrom: the prefix with any trailing '/' stripped.
-	// That value is strictly less than every key returned for this prefix
-	// — including the S3 directory-marker object whose key equals the
-	// prefix verbatim (a zero-byte object intentionally uploaded with the
-	// trailing slash). No key from a sibling prefix can fall into the
-	// resulting range because the byte immediately after a stripped slash
-	// is always > '/' (0x2F).
-	prevKey := strings.TrimSuffix(prefix, "/")
+	// prevKey: the byte string strictly less than any key returned for this
+	// prefix. Stripping a trailing '/' gives us that — the byte after '/'
+	// (0x2F) cannot start any sibling prefix or any unrelated key range.
+	// Also correctly admits the S3 dir-marker object whose key equals the
+	// scanned prefix verbatim.
+	prevKey := strings.TrimSuffix(item.prefix, "/")
 	for p.HasMorePages() {
 		start := s.progress.beginRequest()
 		page, err := p.NextPage(ctx)
@@ -189,10 +202,9 @@ func (s *Scanner) discover(ctx context.Context, workQ chan<- string, batchQ chan
 		if err != nil {
 			return err
 		}
-
 		if len(page.Contents) > 0 {
 			batch := makeBatch(prevKey, page.Contents)
-			logBatch("discover.batch", prefix, batch)
+			logBatch("probe.batch", item.prefix, batch)
 			s.progress.observeBatch(batch.Objects)
 			select {
 			case <-ctx.Done():
@@ -206,8 +218,8 @@ func (s *Scanner) discover(ctx context.Context, workQ chan<- string, batchQ chan
 			if sub == "" {
 				continue
 			}
-			if err := s.discover(ctx, workQ, batchQ, sub, depth+1); err != nil {
-				return err
+			if !enqueue(workItem{prefix: sub, depth: item.depth + 1}) {
+				return ctx.Err()
 			}
 		}
 	}
@@ -215,7 +227,8 @@ func (s *Scanner) discover(ctx context.Context, workQ chan<- string, batchQ chan
 }
 
 // listRecursive performs a paginated, delimiter-less ListObjectsV2 over a
-// single leaf prefix and forwards each page as a radix.Batch.
+// single prefix and forwards each page as a radix.Batch. Used when probing
+// has hit the depth cap — covers the entire remaining sub-tree.
 func (s *Scanner) listRecursive(ctx context.Context, batchQ chan<- radix.Batch, prefix string) error {
 	slog.Debug("listRecursive", "prefix", prefix)
 	p := s3.NewListObjectsV2Paginator(s.s3, &s3.ListObjectsV2Input{

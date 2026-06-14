@@ -34,7 +34,7 @@ type opts struct {
 	region        string
 	endpoint      string
 	workers       int
-	parallelDepth int
+	maxDepth      int
 	snapshotPath  string
 	loadOnly      bool
 	interactive   bool
@@ -51,7 +51,7 @@ func main() {
 	flag.StringVar(&o.region, "region", "", "AWS region (auto-detected when empty)")
 	flag.StringVar(&o.endpoint, "endpoint", "", "non-AWS S3 endpoint URL (uses path-style addressing)")
 	flag.IntVar(&o.workers, "workers", 32, "number of concurrent ListObjectsV2 workers")
-	flag.IntVar(&o.parallelDepth, "parallel-depth", 3, "delimiter-walk depth at which prefixes become parallel work units")
+	flag.IntVar(&o.maxDepth, "max-depth", 8, "cap on delimiter-probe depth; beyond this the worker switches to a paginated recursive scan")
 	flag.StringVar(&o.snapshotPath, "snapshot", "", "path to write/read the binary tree snapshot (defaults to ~/.cache/s3du/<bucket>@<region>/tree.snap)")
 	flag.BoolVar(&o.loadOnly, "load", false, "skip scanning, load the snapshot from -snapshot and continue (e.g., launch TUI)")
 	flag.BoolVar(&o.interactive, "i", false, "launch the bubbletea TUI after the scan finishes")
@@ -148,7 +148,7 @@ func acquireTree(ctx context.Context, o *opts) (*radix.Tree, error) {
 		runProgressUI(prog, done, 250*time.Millisecond, o.progressEvery)
 	})
 
-	scanner := NewScanner(client, o.bucket, o.workers, o.parallelDepth, tree, prog)
+	scanner := NewScanner(client, o.bucket, o.workers, o.maxDepth, tree, prog)
 	start := time.Now()
 	scanErr := scanner.Run(ctx)
 	close(done)
