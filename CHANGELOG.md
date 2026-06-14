@@ -115,28 +115,12 @@ ncdu-inspired keys, beautiful by default (lipgloss, bubbletea).
   prefix. The `rm -rf` for S3. Refuses to operate on versioning-
   Enabled buckets (delete markers don't free storage). Dry-run by
   default; real deletion requires `-yes` + stdin prefix confirmation.
-- **internal/cmd/s3du-sim** — offline strategy A/B harness. Replays
-  ListObjectsV2 against a loaded snapshot to compare discovery
-  algorithms by request count + critical-path requests / worker.
-- **internal/cmd/radix-bench** — microbench for the radix tree.
-- **internal/cmd/gen-demo** — synthetic snapshot generator used to
-  render the README demo without exposing real bucket data.
 
 ### Stats / observability
 
 - **`-stats`** flag: after load, print arena occupancy, per-class
   histograms, heap accounting in allocator-rounded bytes. Drove the
   memory layout decisions above.
-
-### Repository hygiene
-
-- MIT LICENSE.
-- README rewritten with install lines, snapshot workflow, TUI
-  cheat-sheet, demo regeneration instructions.
-- `demo.tape` (vhs script) + synthetic `gen-demo` snapshot — README
-  animation reproducible from a clean clone, no real-bucket data.
-- Build clean under `go vet`. 29 tests across `radix` + `sim`
-  packages, all green under `go test`.
 
 ### Install
 

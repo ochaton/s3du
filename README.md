@@ -48,7 +48,7 @@ via HeadBucket when `-region` is left blank.
 Each scan writes a binary snapshot under the platform's user-cache dir
 (`os.UserCacheDir`):
 
-```
+```plain
 Linux : ~/.cache/s3du/<bucket>@<region>/tree.snap
 macOS : ~/Library/Caches/s3du/<bucket>@<region>/tree.snap
 ```
@@ -58,7 +58,7 @@ flows work against the loaded snapshot.
 
 ## TUI keybindings
 
-```
+```plain
 Navigation       Sort                 Display
 ↑/k  ↓/j         s  by size           g  cycle bar widget
 Home  End/G      n  by name           ?  show this help
