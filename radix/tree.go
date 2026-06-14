@@ -20,8 +20,7 @@ import (
 //	agg:      aggregate over the subtree, materialised on first contribution.
 //	file:     non-nil for S3 dir-marker objects pinned at this node.
 type internal struct {
-	edgeOff  uint32
-	edgeLen  uint32
+	edge     edge
 	children []uint32
 	agg      *Aggregate
 }
@@ -32,9 +31,17 @@ type internal struct {
 // stored aggregate: the leaf's contribution to any ancestor aggregate is
 // derived on demand from (class, size).
 type leaf struct {
-	edgeOff   uint32
-	edgeLen   uint32
+	edge      edge
 	sizeClass uint64
+}
+
+// edge is an address into the Tree's edgeArena. off encodes
+// (chunkIdx << edgeChunkBits) | within; length is the byte count.
+// 8 B; matches the alignment that uint32+uint32 would have produced as
+// separate fields, so no struct growth.
+type edge struct {
+	off    uint32
+	length uint32
 }
 
 // Child IDs in internal.children are tagged uint32s: high bit set means the
@@ -256,13 +263,13 @@ func (t *Tree) releaseChild(cid uint32) {
 	}
 }
 
-// allocEdge copies the bytes of s into the edge arena and returns the
-// (offset, length) pair that addresses them. Empty edges return (0, 0)
-// without consuming arena space.
-func (t *Tree) allocEdge(s string) (uint32, uint32) {
+// allocEdge copies the bytes of s into the edge arena and returns an edge
+// addressing them. Empty input returns the zero edge without consuming
+// arena space.
+func (t *Tree) allocEdge(s string) edge {
 	n := len(s)
 	if n == 0 {
-		return 0, 0
+		return edge{}
 	}
 	if n > edgeChunkSize {
 		panic("radix: edge larger than edgeChunkSize")
@@ -277,19 +284,19 @@ func (t *Tree) allocEdge(s string) (uint32, uint32) {
 	off := t.edgeChunkBase | t.edgeWithin
 	copy(t.edgeArena[len(t.edgeArena)-1][t.edgeWithin:t.edgeWithin+uint32(n)], s)
 	t.edgeWithin += uint32(n)
-	return off, uint32(n)
+	return edge{off: off, length: uint32(n)}
 }
 
-// edgeStr returns a string view of the (off, length) edge bytes. The string
-// shares its backing with the arena — no copy. Safe because the arena is
-// append-only and never resized after allocation.
-func (t *Tree) edgeStr(off, length uint32) string {
-	if length == 0 {
+// edgeStr returns a string view of e's edge bytes. The string shares its
+// backing with the arena — no copy. Safe because the arena is append-only
+// and never resized after allocation.
+func (t *Tree) edgeStr(e edge) string {
+	if e.length == 0 {
 		return ""
 	}
-	chunk := off >> edgeChunkBits
-	within := off & edgeChunkMask
-	return unsafe.String(&t.edgeArena[chunk][within], length)
+	chunk := e.off >> edgeChunkBits
+	within := e.off & edgeChunkMask
+	return unsafe.String(&t.edgeArena[chunk][within], e.length)
 }
 
 // firstByteOf returns the first byte of the edge stored at the child cid.
@@ -297,20 +304,18 @@ func (t *Tree) edgeStr(off, length uint32) string {
 func (t *Tree) firstByteOf(cid uint32) byte {
 	if isLeafID(cid) {
 		l := t.atLeaf(cid & idMask)
-		return t.edgeArena[l.edgeOff>>edgeChunkBits][l.edgeOff&edgeChunkMask]
+		return t.edgeArena[l.edge.off>>edgeChunkBits][l.edge.off&edgeChunkMask]
 	}
 	n := t.atInternal(cid)
-	return t.edgeArena[n.edgeOff>>edgeChunkBits][n.edgeOff&edgeChunkMask]
+	return t.edgeArena[n.edge.off>>edgeChunkBits][n.edge.off&edgeChunkMask]
 }
 
-// edgeOf returns the edge stored at the child cid.
+// edgeOf returns the edge string view stored at the child cid.
 func (t *Tree) edgeOf(cid uint32) string {
 	if isLeafID(cid) {
-		l := t.atLeaf(cid & idMask)
-		return t.edgeStr(l.edgeOff, l.edgeLen)
+		return t.edgeStr(t.atLeaf(cid & idMask).edge)
 	}
-	n := t.atInternal(cid)
-	return t.edgeStr(n.edgeOff, n.edgeLen)
+	return t.edgeStr(t.atInternal(cid).edge)
 }
 
 // aggOfChild returns the Aggregate that the child cid contributes to its
@@ -648,10 +653,8 @@ func (t *Tree) insertFromPath(path []framePath, obj Object) []framePath {
 			// the key as a brand-new leaf in the leaf arena. The edge
 			// arena owns the bytes, so the caller's batch key string is
 			// not pinned for the lifetime of the tree.
-			lOff, lLen := t.allocEdge(key)
 			leafCID := t.allocLeaf(leaf{
-				edgeOff:   lOff,
-				edgeLen:   lLen,
+				edge:      t.allocEdge(key),
 				sizeClass: packSizeClass(obj.Class, obj.Size),
 			})
 			t.atInternal(id).children = insertChildAt(t.atInternal(id).children, idx, leafCID)
@@ -664,7 +667,7 @@ func (t *Tree) insertFromPath(path []framePath, obj Object) []framePath {
 		}
 		childID := childCID
 		child := t.atInternal(childID)
-		childEdge := t.edgeStr(child.edgeOff, child.edgeLen)
+		childEdge := t.edgeStr(child.edge)
 		lcp := longestCommonPrefix(childEdge, key)
 		if lcp == len(childEdge) {
 			// The whole edge is a prefix of the remaining key — descend
@@ -685,12 +688,11 @@ func (t *Tree) insertFromPath(path []framePath, obj Object) []framePath {
 		// lcp) or as a brand-new sibling leaf.
 		intAgg := t.aggForSplitInternalChild(childID, obj)
 		intID := t.allocInternal(internal{
-			edgeOff: child.edgeOff,
-			edgeLen: uint32(lcp),
-			agg:     intAgg,
+			edge: edge{off: child.edge.off, length: uint32(lcp)},
+			agg:  intAgg,
 		})
-		t.atInternal(childID).edgeOff += uint32(lcp)
-		t.atInternal(childID).edgeLen -= uint32(lcp)
+		t.atInternal(childID).edge.off += uint32(lcp)
+		t.atInternal(childID).edge.length -= uint32(lcp)
 
 		if lcp == len(key) {
 			inter := t.atInternal(intID)
@@ -700,10 +702,8 @@ func (t *Tree) insertFromPath(path []framePath, obj Object) []framePath {
 			return append(path, framePath{id: intID, consumed: consumed + lcp})
 		}
 
-		lOff, lLen := t.allocEdge(key[lcp:])
 		leafCID := t.allocLeaf(leaf{
-			edgeOff:   lOff,
-			edgeLen:   lLen,
+			edge:      t.allocEdge(key[lcp:]),
 			sizeClass: packSizeClass(obj.Class, obj.Size),
 		})
 		t.atInternal(intID).children = t.sortChildren(childCID, leafCID)
@@ -725,7 +725,7 @@ func (t *Tree) insertFromPath(path []framePath, obj Object) []framePath {
 func (t *Tree) insertAgainstLeafChild(path []framePath, parentID uint32, childSlot int, childCID uint32, obj Object, key string, consumed int) []framePath {
 	leafID := childCID & idMask
 	lf := t.atLeaf(leafID)
-	lfEdge := t.edgeStr(lf.edgeOff, lf.edgeLen)
+	lfEdge := t.edgeStr(lf.edge)
 	lcp := longestCommonPrefix(lfEdge, key)
 
 	if lcp == len(lfEdge) && lcp == len(key) {
@@ -742,25 +742,21 @@ func (t *Tree) insertAgainstLeafChild(path []framePath, parentID uint32, childSl
 		// internal-with-file and attach a new leaf for the key suffix.
 		oldClass := lf.class()
 		oldSize := lf.size()
-		oldOff := lf.edgeOff
-		oldLen := lf.edgeLen
+		oldEdge := lf.edge
 
 		var ag Aggregate
 		ag.Objects = 2
 		ag.Bytes.Add(oldClass, oldSize)
 		ag.Bytes.Add(obj.Class, obj.Size)
 		intID := t.allocInternal(internal{
-			edgeOff: oldOff,
-			edgeLen: oldLen,
-			agg:     &ag,
+			edge: oldEdge,
+			agg:  &ag,
 		})
 		t.setDirMarker(intID, ClassByte{Class: oldClass, Size: oldSize})
 		t.releaseLeaf(leafID)
 
-		nOff, nLen := t.allocEdge(key[lcp:])
 		newLeafCID := t.allocLeaf(leaf{
-			edgeOff:   nOff,
-			edgeLen:   nLen,
+			edge:      t.allocEdge(key[lcp:]),
 			sizeClass: packSizeClass(obj.Class, obj.Size),
 		})
 		t.atInternal(intID).children = []uint32{newLeafCID}
@@ -770,24 +766,23 @@ func (t *Tree) insertAgainstLeafChild(path []framePath, parentID uint32, childSl
 
 	// lcp < len(lfEdge): leaf and key diverge after lcp.
 	// New intermediate internal carries the lcp-prefix view of the leaf's
-	// existing arena bytes; the existing leaf advances its (off, len) by
-	// lcp and stays a leaf.
+	// existing arena bytes; the existing leaf advances its off by lcp and
+	// stays a leaf.
 	var ag Aggregate
 	ag.Objects = 2
 	ag.Bytes.Add(lf.class(), lf.size())
 	ag.Bytes.Add(obj.Class, obj.Size)
 	intID := t.allocInternal(internal{
-		edgeOff: lf.edgeOff,
-		edgeLen: uint32(lcp),
-		agg:     &ag,
+		edge: edge{off: lf.edge.off, length: uint32(lcp)},
+		agg:  &ag,
 	})
 
 	if lcp == len(key) {
 		// key ends exactly at the new internal — it picks up obj as a
 		// dir-marker. The existing leaf gets trimmed and lives on as the
 		// sole child.
-		lf.edgeOff += uint32(lcp)
-		lf.edgeLen -= uint32(lcp)
+		lf.edge.off += uint32(lcp)
+		lf.edge.length -= uint32(lcp)
 		inter := t.atInternal(intID)
 		t.setDirMarker(intID, ClassByte{Class: obj.Class, Size: obj.Size})
 		inter.children = []uint32{childCID}
@@ -795,12 +790,10 @@ func (t *Tree) insertAgainstLeafChild(path []framePath, parentID uint32, childSl
 		return append(path, framePath{id: intID, consumed: consumed + lcp})
 	}
 
-	lf.edgeOff += uint32(lcp)
-	lf.edgeLen -= uint32(lcp)
-	nOff, nLen := t.allocEdge(key[lcp:])
+	lf.edge.off += uint32(lcp)
+	lf.edge.length -= uint32(lcp)
 	newLeafCID := t.allocLeaf(leaf{
-		edgeOff:   nOff,
-		edgeLen:   nLen,
+		edge:      t.allocEdge(key[lcp:]),
 		sizeClass: packSizeClass(obj.Class, obj.Size),
 	})
 	t.atInternal(intID).children = t.sortChildren(childCID, newLeafCID)
@@ -934,16 +927,12 @@ func (t *Tree) compressAfterDelete(pops []deletePop) {
 			t.releaseInternal(childCID)
 		case !hasMarker && len(child.children) == 1:
 			onlyCID := child.children[0]
-			merged := t.edgeStr(child.edgeOff, child.edgeLen) + t.edgeOf(onlyCID)
-			mOff, mLen := t.allocEdge(merged)
+			merged := t.edgeStr(child.edge) + t.edgeOf(onlyCID)
+			mEdge := t.allocEdge(merged)
 			if isLeafID(onlyCID) {
-				only := t.atLeaf(onlyCID & idMask)
-				only.edgeOff = mOff
-				only.edgeLen = mLen
+				t.atLeaf(onlyCID & idMask).edge = mEdge
 			} else {
-				only := t.atInternal(onlyCID)
-				only.edgeOff = mOff
-				only.edgeLen = mLen
+				t.atInternal(onlyCID).edge = mEdge
 			}
 			parent.children[fr.childIdx] = onlyCID
 			t.releaseInternal(childCID)
@@ -1205,7 +1194,7 @@ func (t *Tree) Stats() TreeStats {
 			s.ClassBytesCap += int64(cap(n.agg.Bytes))
 			s.EstHeapAggBytes += int64(sizeClass(cap(n.agg.Bytes) * classByteSize))
 		}
-		el := int(n.edgeLen)
+		el := int(n.edge.length)
 		s.EdgeBytes += int64(el)
 		if el > s.MaxEdgeLen {
 			s.MaxEdgeLen = el
@@ -1235,7 +1224,7 @@ func (t *Tree) Stats() TreeStats {
 		s.AliveLeaves++
 		s.Leaves++
 
-		el := int(l.edgeLen)
+		el := int(l.edge.length)
 		s.EdgeBytes += int64(el)
 		if el > s.MaxEdgeLen {
 			s.MaxEdgeLen = el

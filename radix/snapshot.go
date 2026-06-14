@@ -194,10 +194,8 @@ func Load(r io.Reader) (*Tree, error) {
 
 		isLeaf := rec.id != 0 && rec.file != nil && len(rec.children) == 0 && rec.agg == nil
 		if isLeaf {
-			off, length := t.allocEdge(rec.edge)
 			cid := t.allocLeaf(leaf{
-				edgeOff:   off,
-				edgeLen:   length,
+				edge:      t.allocEdge(rec.edge),
 				sizeClass: packSizeClass(rec.file.Class, rec.file.Size),
 			})
 			diskToCID[rec.id] = cid
@@ -211,10 +209,8 @@ func Load(r io.Reader) (*Tree, error) {
 		} else {
 			memID = t.allocInternal(internal{})
 		}
-		off, length := t.allocEdge(rec.edge)
 		n := t.atInternal(memID)
-		n.edgeOff = off
-		n.edgeLen = length
+		n.edge = t.allocEdge(rec.edge)
 		n.agg = rec.agg
 		n.children = rec.children // disk IDs; rewritten below
 		if rec.file != nil {
@@ -297,7 +293,7 @@ func (t *Tree) Export(yield func(Object) bool) {
 
 func (t *Tree) exportFromInternal(id uint32, prefix string, yield func(Object) bool) bool {
 	n := t.atInternal(id)
-	fullKey := prefix + t.edgeStr(n.edgeOff, n.edgeLen)
+	fullKey := prefix + t.edgeStr(n.edge)
 	if cb, ok := t.dirMarker(id); ok {
 		if !yield(Object{Key: fullKey, Size: cb.Size, Class: cb.Class}) {
 			return false
@@ -306,7 +302,7 @@ func (t *Tree) exportFromInternal(id uint32, prefix string, yield func(Object) b
 	for _, cid := range n.children {
 		if isLeafID(cid) {
 			lf := t.atLeaf(cid & idMask)
-			if !yield(Object{Key: fullKey + t.edgeStr(lf.edgeOff, lf.edgeLen), Size: lf.size(), Class: lf.class()}) {
+			if !yield(Object{Key: fullKey + t.edgeStr(lf.edge), Size: lf.size(), Class: lf.class()}) {
 				return false
 			}
 			continue
@@ -365,15 +361,15 @@ func (t *Tree) writeInternalRecord(w *bufio.Writer, diskID uint32, arenaID uint3
 	var hdr [9]byte
 	binary.LittleEndian.PutUint32(hdr[0:4], diskID)
 	hdr[4] = flags
-	binary.LittleEndian.PutUint16(hdr[5:7], uint16(n.edgeLen))
+	binary.LittleEndian.PutUint16(hdr[5:7], uint16(n.edge.length))
 	binary.LittleEndian.PutUint16(hdr[7:9], uint16(len(n.children)))
 	if _, err := w.Write(hdr[:]); err != nil {
 		return err
 	}
-	if n.edgeLen > 0 {
-		chunk := n.edgeOff >> edgeChunkBits
-		within := n.edgeOff & edgeChunkMask
-		if _, err := w.Write(t.edgeArena[chunk][within : within+n.edgeLen]); err != nil {
+	if n.edge.length > 0 {
+		chunk := n.edge.off >> edgeChunkBits
+		within := n.edge.off & edgeChunkMask
+		if _, err := w.Write(t.edgeArena[chunk][within : within+n.edge.length]); err != nil {
 			return err
 		}
 	}
@@ -420,15 +416,15 @@ func (t *Tree) writeLeafRecord(w *bufio.Writer, id uint32, l *leaf) error {
 	var hdr [9]byte
 	binary.LittleEndian.PutUint32(hdr[0:4], id)
 	hdr[4] = snapFlagHasFile
-	binary.LittleEndian.PutUint16(hdr[5:7], uint16(l.edgeLen))
+	binary.LittleEndian.PutUint16(hdr[5:7], uint16(l.edge.length))
 	binary.LittleEndian.PutUint16(hdr[7:9], 0)
 	if _, err := w.Write(hdr[:]); err != nil {
 		return err
 	}
-	if l.edgeLen > 0 {
-		chunk := l.edgeOff >> edgeChunkBits
-		within := l.edgeOff & edgeChunkMask
-		if _, err := w.Write(t.edgeArena[chunk][within : within+l.edgeLen]); err != nil {
+	if l.edge.length > 0 {
+		chunk := l.edge.off >> edgeChunkBits
+		within := l.edge.off & edgeChunkMask
+		if _, err := w.Write(t.edgeArena[chunk][within : within+l.edge.length]); err != nil {
 			return err
 		}
 	}
