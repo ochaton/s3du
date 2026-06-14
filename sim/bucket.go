@@ -12,6 +12,7 @@
 package sim
 
 import (
+	"bytes"
 	"context"
 	"strings"
 	"sync/atomic"
@@ -34,6 +35,42 @@ const maxS3KeyBytes = 1024
 // in that subtree but strictly less than the smallest key beyond it. Pre-
 // allocated once at startup.
 var subtreePad = strings.Repeat("\xff", maxS3KeyBytes)
+
+// prefixLowerExclusive returns a string that lex-precedes every key with
+// the given prefix and lex-succeeds every key strictly less than the
+// prefix region. It is constructed by decrementing the last byte and
+// padding with 0xFF, which:
+//
+//   - keeps the result strictly less than prefix (different lex-byte at
+//     the boundary position),
+//   - exceeds any key whose bytes diverge from prefix earlier on the path.
+//
+// Returns "" for an empty prefix (no lower bound to enforce) or for a
+// prefix whose last byte is 0x00 (degenerate — drops the byte instead).
+func prefixLowerExclusive(prefix string) string {
+	if prefix == "" {
+		return ""
+	}
+	b := []byte(prefix)
+	last := b[len(b)-1]
+	if last == 0 {
+		return string(b[:len(b)-1])
+	}
+	b[len(b)-1] = last - 1
+	return string(b) + subtreePad
+}
+
+// iteratorStart returns the exclusive lower bound to hand to NewIterator
+// for a ListReq, taking the user-supplied StartAfter when it already sits
+// inside or past the prefix region but advancing to the prefix's
+// lex-predecessor otherwise so the iterator's first returned key is the
+// first object actually under prefix.
+func iteratorStart(prefix, startAfter string) string {
+	if pred := prefixLowerExclusive(prefix); pred > startAfter {
+		return pred
+	}
+	return startAfter
+}
 
 // Bucket is an in-memory S3 emulator backed by a radix.Tree. Safe for
 // concurrent List calls.
@@ -61,11 +98,16 @@ type ListReq struct {
 	MaxKeys    int // capped at MaxKeysCap
 }
 
-// ListResp mirrors the relevant fields of ListObjectsV2Output. CommonPrefixes
-// is populated only when Delimiter == "/".
+// ListResp is a count-and-metadata projection of ListObjectsV2Output. The
+// simulator never materialises individual Content keys — strategies under
+// test only need the count, the discovered CommonPrefixes (for fan-out),
+// and a continuation token, so paying for 50 M string allocations on a
+// 50 M-object scan is wasteful. Per-content metadata (sizes, classes,
+// per-storage-class rollups) belongs in dedicated future helpers if a
+// strategy ever needs them.
 type ListResp struct {
-	Contents              []radix.Object
-	CommonPrefixes        []string
+	ContentsCount         int      // # of Contents entries this page would have returned
+	CommonPrefixes        []string // CommonPrefix groupings, always materialised (small N per page)
 	NextContinuationToken string
 	IsTruncated           bool
 }
@@ -92,7 +134,7 @@ func (b *Bucket) List(ctx context.Context, req ListReq) (ListResp, error) {
 	} else {
 		resp = b.listNoDelimiter(req, maxKeys)
 	}
-	b.objects.Add(int64(len(resp.Contents)))
+	b.objects.Add(int64(resp.ContentsCount))
 	return resp, nil
 }
 
@@ -110,63 +152,78 @@ func (b *Bucket) ObjectsServed() int64 {
 }
 
 func (b *Bucket) listNoDelimiter(req ListReq, maxKeys int) ListResp {
-	it := b.tree.NewIterator(req.StartAfter)
-	resp := ListResp{Contents: make([]radix.Object, 0, maxKeys)}
+	it := b.tree.NewIterator(iteratorStart(req.Prefix, req.StartAfter))
+	prefixBytes := []byte(req.Prefix)
+	var resp ListResp
 	var lastKey string
-	for len(resp.Contents) < maxKeys {
-		obj, ok := it.Next()
-		if !ok {
-			return resp
+
+	// Iterator.Walk yields each key as a byte view into the cursor's path
+	// buffer — zero-alloc per object. We only materialise a string at the
+	// moment we decide to stop the page (either because MaxKeys reached or
+	// because the prefix region is exhausted), and only for that one key.
+	stopAtFollowing := false
+	it.Walk(func(key []byte, _ radix.StorageClass, _ int64) bool {
+		if stopAtFollowing {
+			// We've already collected MaxKeys; one more candidate confirms
+			// truncation. Capture it and stop.
+			if len(key) >= len(prefixBytes) && bytes.HasPrefix(key, prefixBytes) {
+				resp.IsTruncated = true
+				resp.NextContinuationToken = lastKey
+			}
+			return false
 		}
-		if !strings.HasPrefix(obj.Key, req.Prefix) {
-			return resp
+		if !bytes.HasPrefix(key, prefixBytes) {
+			return false
 		}
-		resp.Contents = append(resp.Contents, obj)
-		lastKey = obj.Key
-	}
-	// Page full; check if anything more under prefix exists.
-	if more, ok := it.Next(); ok && strings.HasPrefix(more.Key, req.Prefix) {
-		resp.IsTruncated = true
-		resp.NextContinuationToken = lastKey
-	}
+		resp.ContentsCount++
+		if resp.ContentsCount >= maxKeys {
+			lastKey = string(key)
+			stopAtFollowing = true
+			return true
+		}
+		return true
+	})
 	return resp
 }
 
 func (b *Bucket) listWithDelimiter(req ListReq, maxKeys int) ListResp {
-	it := b.tree.NewIterator(req.StartAfter)
-	resp := ListResp{
-		Contents:       make([]radix.Object, 0, maxKeys/2),
-		CommonPrefixes: make([]string, 0, maxKeys/2),
-	}
+	it := b.tree.NewIterator(iteratorStart(req.Prefix, req.StartAfter))
+	prefixBytes := []byte(req.Prefix)
+	resp := ListResp{CommonPrefixes: make([]string, 0, 32)}
 	var lastEmitted string
-	for len(resp.Contents)+len(resp.CommonPrefixes) < maxKeys {
-		obj, ok := it.Next()
-		if !ok {
-			return resp
+	emitted := 0
+	stopAtFollowing := false
+
+	it.Walk(func(key []byte, _ radix.StorageClass, _ int64) bool {
+		if stopAtFollowing {
+			if len(key) >= len(prefixBytes) && bytes.HasPrefix(key, prefixBytes) {
+				resp.IsTruncated = true
+				resp.NextContinuationToken = lastEmitted
+			}
+			return false
 		}
-		if !strings.HasPrefix(obj.Key, req.Prefix) {
-			return resp
+		if !bytes.HasPrefix(key, prefixBytes) {
+			return false
 		}
-		suffix := obj.Key[len(req.Prefix):]
-		if idx := strings.IndexByte(suffix, '/'); idx >= 0 {
-			groupKey := req.Prefix + suffix[:idx+1]
+		suffix := key[len(prefixBytes):]
+		if idx := bytes.IndexByte(suffix, '/'); idx >= 0 {
+			groupKey := string(key[:len(prefixBytes)+idx+1])
 			resp.CommonPrefixes = append(resp.CommonPrefixes, groupKey)
-			// The continuation token for a CommonPrefix must strictly
-			// exceed every key beneath that prefix but stay strictly less
-			// than the next sibling outside the subtree. Padding with
-			// 0xFF up to S3's max key length satisfies both bounds and
-			// also doubles as the SkipTo target for in-call pagination.
 			lastEmitted = groupKey + subtreePad
 			it.SkipTo(lastEmitted)
-			continue
+			emitted++
+			if emitted >= maxKeys {
+				stopAtFollowing = true
+			}
+			return true
 		}
-		resp.Contents = append(resp.Contents, obj)
-		lastEmitted = obj.Key
-	}
-	// Page full; check if anything more under prefix exists.
-	if more, ok := it.Next(); ok && strings.HasPrefix(more.Key, req.Prefix) {
-		resp.IsTruncated = true
-		resp.NextContinuationToken = lastEmitted
-	}
+		resp.ContentsCount++
+		emitted++
+		if emitted >= maxKeys {
+			lastEmitted = string(key)
+			stopAtFollowing = true
+		}
+		return true
+	})
 	return resp
 }

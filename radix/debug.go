@@ -134,3 +134,16 @@ func (it *Iterator) SkipTo(skipKey string) {
 		it.rc.lo = skipKey
 	}
 }
+
+// Walk yields every remaining (key, class, size) triple in ascending lex
+// order, invoking yield exactly once per object. key is a VIEW into the
+// iterator's internal path buffer and is INVALIDATED as soon as yield
+// returns — callers that need to retain it must copy the bytes (e.g.
+// string(key) once, outside the hot loop).
+//
+// Returning false from yield stops the walk. Walk is the zero-alloc-per-
+// object alternative to Next; it is what sim.Bucket uses to avoid 50 M
+// string allocations during a full bucket sweep.
+func (it *Iterator) Walk(yield func(key []byte, class StorageClass, size int64) bool) {
+	it.rc.walk(yield)
+}

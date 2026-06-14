@@ -1046,27 +1046,35 @@ func (t *Tree) applyDelta(path []framePath, class StorageClass, sizeDelta, objDe
 // passes) are not safe to interleave with iteration. AddBatch arranges its
 // callers so the cursor is fully drained before any mutation happens.
 type rangeCursor struct {
-	t      *Tree
+	t           *Tree
 	stack       []cursorFrame
+	pathBuf     []byte // shared path-byte buffer, grown on descent, truncated on ascend
 	lo, hi      string
 	unboundedHi bool // when true, the hi bound is ignored — iterate to end
 }
 
+// cursorFrame tracks one internal on the descent stack. pathLen is the
+// length of the cursor's pathBuf up to and including this frame's edge —
+// pathBuf[:pathLen] is the full byte path from root to this node. Storing
+// just the length (not the string) lets the cursor reuse a single growable
+// byte buffer for the entire walk, eliminating one heap allocation per
+// node visited.
 type cursorFrame struct {
 	id          uint32
-	prefix      string // bytes from root including this node's edge
-	nextChild   int    // index of next unvisited child
+	pathLen     int
+	nextChild   int
 	fileEmitted bool
 }
 
 func (t *Tree) newRangeCursor(lo, hi string) *rangeCursor {
 	rc := &rangeCursor{
-		t:     t,
-		lo:    lo,
-		hi:    hi,
-		stack: make([]cursorFrame, 1, 16),
+		t:       t,
+		lo:      lo,
+		hi:      hi,
+		pathBuf: make([]byte, 0, 256),
+		stack:   make([]cursorFrame, 1, 16),
 	}
-	rc.stack[0] = cursorFrame{id: rootID}
+	rc.stack[0] = cursorFrame{id: rootID, pathLen: 0}
 	return rc
 }
 
@@ -1077,43 +1085,134 @@ func (t *Tree) newRangeCursor(lo, hi string) *rangeCursor {
 // Stack frames hold INTERNAL IDs only; leaf children are emitted inline as
 // the descent visits each child slot without pushing a new frame, since
 // leaves have no further descent.
+//
+// pathBuf carries the current root→node byte path. On descent it is
+// appended; on ascend (frame pop) it is truncated to the parent frame's
+// pathLen. A leaf-emit / skip restores it to the parent's length too. The
+// only allocation per emit is the one string copy of the leaf's full key
+// for the returned Object.Key — every comparison along the way uses an
+// unsafe.String view that shares pathBuf's backing.
 func (rc *rangeCursor) Next() (Object, bool) {
 	for len(rc.stack) > 0 {
 		top := &rc.stack[len(rc.stack)-1]
 		n := rc.t.atInternal(top.id)
 		if !top.fileEmitted {
 			top.fileEmitted = true
-			if cb, ok := rc.t.dirMarker(top.id); ok && top.prefix > rc.lo && (rc.unboundedHi || top.prefix <= rc.hi) {
-				return Object{Key: top.prefix, Size: cb.Size, Class: cb.Class}, true
+			if cb, ok := rc.t.dirMarker(top.id); ok {
+				path := unsafe.String(unsafe.SliceData(rc.pathBuf), top.pathLen)
+				if path > rc.lo && (rc.unboundedHi || path <= rc.hi) {
+					return Object{Key: string(rc.pathBuf[:top.pathLen]), Size: cb.Size, Class: cb.Class}, true
+				}
 			}
 		}
 		if top.nextChild >= len(n.children) {
 			rc.stack = rc.stack[:len(rc.stack)-1]
+			if len(rc.stack) > 0 {
+				rc.pathBuf = rc.pathBuf[:rc.stack[len(rc.stack)-1].pathLen]
+			} else {
+				rc.pathBuf = rc.pathBuf[:0]
+			}
 			continue
 		}
 		cid := n.children[top.nextChild]
 		top.nextChild++
-		childEdge := rc.t.edgeOf(cid)
-		childKey := top.prefix + childEdge
+		savedLen := len(rc.pathBuf)
+		rc.pathBuf = append(rc.pathBuf, rc.t.edgeOf(cid)...)
+		childPath := unsafe.String(unsafe.SliceData(rc.pathBuf), len(rc.pathBuf))
+
 		// All subsequent siblings have a strictly greater first byte, hence
 		// strictly greater childKey — once one exceeds hi, pop the frame.
-		if !rc.unboundedHi && childKey > rc.hi {
+		if !rc.unboundedHi && childPath > rc.hi {
+			rc.pathBuf = rc.pathBuf[:savedLen]
 			rc.stack = rc.stack[:len(rc.stack)-1]
-			continue
-		}
-		if isLeafID(cid) {
-			if childKey > rc.lo && (rc.unboundedHi || childKey <= rc.hi) {
-				lf := rc.t.atLeaf(cid & idMask)
-				return Object{Key: childKey, Size: lf.size(), Class: lf.class()}, true
+			if len(rc.stack) > 0 {
+				rc.pathBuf = rc.pathBuf[:rc.stack[len(rc.stack)-1].pathLen]
+			} else {
+				rc.pathBuf = rc.pathBuf[:0]
 			}
 			continue
 		}
-		if childKey < rc.lo && !strings.HasPrefix(rc.lo, childKey) {
+		if isLeafID(cid) {
+			if childPath > rc.lo && (rc.unboundedHi || childPath <= rc.hi) {
+				lf := rc.t.atLeaf(cid & idMask)
+				obj := Object{Key: string(rc.pathBuf), Size: lf.size(), Class: lf.class()}
+				rc.pathBuf = rc.pathBuf[:savedLen]
+				return obj, true
+			}
+			rc.pathBuf = rc.pathBuf[:savedLen]
 			continue
 		}
-		rc.stack = append(rc.stack, cursorFrame{id: cid, prefix: childKey})
+		if childPath < rc.lo && !strings.HasPrefix(rc.lo, childPath) {
+			rc.pathBuf = rc.pathBuf[:savedLen]
+			continue
+		}
+		rc.stack = append(rc.stack, cursorFrame{id: cid, pathLen: len(rc.pathBuf)})
 	}
 	return Object{}, false
+}
+
+// walk yields every remaining object via yield, in ascending lex order,
+// without allocating a string per emit. The key slice passed to yield is
+// a VIEW into pathBuf and is only valid until yield returns.
+func (rc *rangeCursor) walk(yield func(key []byte, class StorageClass, size int64) bool) {
+	for len(rc.stack) > 0 {
+		top := &rc.stack[len(rc.stack)-1]
+		n := rc.t.atInternal(top.id)
+		if !top.fileEmitted {
+			top.fileEmitted = true
+			if cb, ok := rc.t.dirMarker(top.id); ok {
+				path := unsafe.String(unsafe.SliceData(rc.pathBuf), top.pathLen)
+				if path > rc.lo && (rc.unboundedHi || path <= rc.hi) {
+					if !yield(rc.pathBuf[:top.pathLen], cb.Class, cb.Size) {
+						return
+					}
+				}
+			}
+		}
+		if top.nextChild >= len(n.children) {
+			rc.stack = rc.stack[:len(rc.stack)-1]
+			if len(rc.stack) > 0 {
+				rc.pathBuf = rc.pathBuf[:rc.stack[len(rc.stack)-1].pathLen]
+			} else {
+				rc.pathBuf = rc.pathBuf[:0]
+			}
+			continue
+		}
+		cid := n.children[top.nextChild]
+		top.nextChild++
+		savedLen := len(rc.pathBuf)
+		rc.pathBuf = append(rc.pathBuf, rc.t.edgeOf(cid)...)
+		childPath := unsafe.String(unsafe.SliceData(rc.pathBuf), len(rc.pathBuf))
+
+		if !rc.unboundedHi && childPath > rc.hi {
+			rc.pathBuf = rc.pathBuf[:savedLen]
+			rc.stack = rc.stack[:len(rc.stack)-1]
+			if len(rc.stack) > 0 {
+				rc.pathBuf = rc.pathBuf[:rc.stack[len(rc.stack)-1].pathLen]
+			} else {
+				rc.pathBuf = rc.pathBuf[:0]
+			}
+			continue
+		}
+		if isLeafID(cid) {
+			if childPath > rc.lo && (rc.unboundedHi || childPath <= rc.hi) {
+				lf := rc.t.atLeaf(cid & idMask)
+				cont := yield(rc.pathBuf, lf.class(), lf.size())
+				rc.pathBuf = rc.pathBuf[:savedLen]
+				if !cont {
+					return
+				}
+				continue
+			}
+			rc.pathBuf = rc.pathBuf[:savedLen]
+			continue
+		}
+		if childPath < rc.lo && !strings.HasPrefix(rc.lo, childPath) {
+			rc.pathBuf = rc.pathBuf[:savedLen]
+			continue
+		}
+		rc.stack = append(rc.stack, cursorFrame{id: cid, pathLen: len(rc.pathBuf)})
+	}
 }
 
 // TreeStats is a memory-accounting snapshot of the tree's in-arena state.

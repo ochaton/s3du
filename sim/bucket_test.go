@@ -32,14 +32,6 @@ func buildTree(t *testing.T, keys ...string) *radix.Tree {
 	return tr
 }
 
-func keysOf(objs []radix.Object) []string {
-	out := make([]string, 0, len(objs))
-	for _, o := range objs {
-		out = append(out, o.Key)
-	}
-	return out
-}
-
 func TestListNoDelimiterReturnsEverythingUnderPrefix(t *testing.T) {
 	tr := buildTree(t,
 		"a/1", "a/2", "a/3",
@@ -52,10 +44,8 @@ func TestListNoDelimiterReturnsEverythingUnderPrefix(t *testing.T) {
 	if err != nil {
 		t.Fatalf("List: %v", err)
 	}
-	got := keysOf(resp.Contents)
-	want := []string{"a/1", "a/2", "a/3"}
-	if !reflect.DeepEqual(got, want) {
-		t.Fatalf("Contents = %v, want %v", got, want)
+	if resp.ContentsCount != 3 {
+		t.Fatalf("ContentsCount = %d, want 3", resp.ContentsCount)
 	}
 	if resp.IsTruncated {
 		t.Fatalf("unexpected truncation")
@@ -78,8 +68,8 @@ func TestListWithDelimiterGroupsCommonPrefixes(t *testing.T) {
 	if err != nil {
 		t.Fatalf("List: %v", err)
 	}
-	if got, want := keysOf(resp.Contents), []string{"top.txt"}; !reflect.DeepEqual(got, want) {
-		t.Fatalf("Contents = %v, want %v", got, want)
+	if resp.ContentsCount != 1 {
+		t.Fatalf("ContentsCount = %d, want 1 (top.txt)", resp.ContentsCount)
 	}
 	if got, want := resp.CommonPrefixes, []string{"a/", "b/"}; !reflect.DeepEqual(got, want) {
 		t.Fatalf("CommonPrefixes = %v, want %v", got, want)
@@ -99,40 +89,34 @@ func TestListWithDelimiterUnderPrefix(t *testing.T) {
 	if err != nil {
 		t.Fatalf("List: %v", err)
 	}
-	if got, want := keysOf(resp.Contents), []string{"docs/index.html"}; !reflect.DeepEqual(got, want) {
-		t.Fatalf("Contents = %v, want %v", got, want)
+	if resp.ContentsCount != 1 {
+		t.Fatalf("ContentsCount = %d, want 1 (docs/index.html)", resp.ContentsCount)
 	}
 	if got, want := resp.CommonPrefixes, []string{"docs/2024/", "docs/2025/"}; !reflect.DeepEqual(got, want) {
 		t.Fatalf("CommonPrefixes = %v, want %v", got, want)
 	}
 }
 
-func TestPaginationMatchesUnpagedResult(t *testing.T) {
+func TestPaginationCountsAddUp(t *testing.T) {
 	tr := buildTree(t,
 		"a/1", "a/2", "a/3", "a/4", "a/5", "a/6", "a/7", "a/8", "a/9", "a/10",
 	)
 	b := New(tr, 0)
 
-	// Unpaged.
 	full, _ := b.List(context.Background(), ListReq{Prefix: "a/", MaxKeys: 100})
-	wantKeys := keysOf(full.Contents)
 
-	// Three-at-a-time pages.
-	got := make([]string, 0)
+	pagedTotal := 0
 	startAfter := ""
 	for {
 		resp, _ := b.List(context.Background(), ListReq{Prefix: "a/", MaxKeys: 3, StartAfter: startAfter})
-		got = append(got, keysOf(resp.Contents)...)
+		pagedTotal += resp.ContentsCount
 		if !resp.IsTruncated {
 			break
 		}
 		startAfter = resp.NextContinuationToken
 	}
-
-	// The keys "1, 10, 2, 3, ..." sort lex; both paths should produce the
-	// same ordered slice.
-	if !reflect.DeepEqual(got, wantKeys) {
-		t.Fatalf("paged = %v, want %v", got, wantKeys)
+	if pagedTotal != full.ContentsCount {
+		t.Fatalf("paged count = %d, want %d", pagedTotal, full.ContentsCount)
 	}
 }
 
@@ -147,7 +131,6 @@ func TestDelimiterPaginationMaxKeys(t *testing.T) {
 	)
 	b := New(tr, 0)
 
-	// Page 1: at most 3 entries.
 	p1, _ := b.List(context.Background(), ListReq{Delimiter: "/", MaxKeys: 3})
 	if len(p1.CommonPrefixes) != 3 {
 		t.Fatalf("page 1 CommonPrefixes len = %d, want 3", len(p1.CommonPrefixes))
@@ -156,7 +139,6 @@ func TestDelimiterPaginationMaxKeys(t *testing.T) {
 		t.Fatalf("page 1 expected truncated")
 	}
 
-	// Page 2.
 	p2, _ := b.List(context.Background(), ListReq{Delimiter: "/", MaxKeys: 100, StartAfter: p1.NextContinuationToken})
 	want := []string{"d/", "e/", "f/"}
 	if !reflect.DeepEqual(p2.CommonPrefixes, want) {
@@ -175,35 +157,32 @@ func TestRequestsCounter(t *testing.T) {
 	}
 }
 
-// TestExhaustiveListMatchesExport sanity-checks that a paged delimiter-less
-// listing returns every key in the tree, in the same order as Export, with
-// no duplicates.
-func TestExhaustiveListMatchesExport(t *testing.T) {
+func TestExhaustiveListCountMatchesExport(t *testing.T) {
 	var keys []string
 	for i := range 100 {
 		keys = append(keys, "obj-"+strings.Repeat("x", i%10)+"-"+itoa(i))
 	}
 	tr := buildTree(t, keys...)
 
-	var expected []string
+	var expectedCount int
 	tr.Export(func(o radix.Object) bool {
-		expected = append(expected, o.Key)
+		expectedCount++
 		return true
 	})
 
 	b := New(tr, 0)
-	got := make([]string, 0, len(expected))
+	totalCount := 0
 	startAfter := ""
 	for {
 		resp, _ := b.List(context.Background(), ListReq{MaxKeys: 7, StartAfter: startAfter})
-		got = append(got, keysOf(resp.Contents)...)
+		totalCount += resp.ContentsCount
 		if !resp.IsTruncated {
 			break
 		}
 		startAfter = resp.NextContinuationToken
 	}
-	if !reflect.DeepEqual(got, expected) {
-		t.Fatalf("paged listing != Export\ngot  = %v\nwant = %v", got, expected)
+	if totalCount != expectedCount {
+		t.Fatalf("paged total = %d, want %d", totalCount, expectedCount)
 	}
 }
 
