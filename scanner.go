@@ -102,7 +102,27 @@ func (s *Scanner) Run(ctx context.Context) error {
 
 	var pending atomic.Int64
 
-	enqueue := func(item workItem) bool {
+	// tryEnqueue tries to publish a work item to workQ without blocking. If
+	// the queue is full the caller is told (false return) to process the
+	// item inline instead; this avoids the deadlock where every worker is
+	// blocked in send to a full queue with no goroutine left to drain it.
+	// The seed item uses the blocking variant via enqueueBlocking below.
+	tryEnqueue := func(item workItem) bool {
+		if ctx.Err() != nil {
+			return false
+		}
+		pending.Add(1)
+		select {
+		case workQ <- item:
+			return true
+		default:
+			pending.Add(-1)
+			return false
+		}
+	}
+	// enqueueBlocking is used only for the seed item, where there is no
+	// alternative path to take. Workers always go through tryEnqueue.
+	enqueueBlocking := func(item workItem) bool {
 		pending.Add(1)
 		select {
 		case workQ <- item:
@@ -111,6 +131,18 @@ func (s *Scanner) Run(ctx context.Context) error {
 			pending.Add(-1)
 			return false
 		}
+	}
+
+	// dispatch is what workers call to schedule a sub-prefix: try to publish
+	// to workQ; if the queue is full, process inline in the same goroutine.
+	// The recursive reference uses a forward var because closures can't see
+	// their own name during initialisation.
+	var dispatch func(workItem) error
+	dispatch = func(item workItem) error {
+		if tryEnqueue(item) {
+			return nil
+		}
+		return s.processItem(ctx, item, dispatch, batchQ)
 	}
 
 	var wgWriter, wgWorkers sync.WaitGroup
@@ -139,7 +171,7 @@ func (s *Scanner) Run(ctx context.Context) error {
 				case <-done:
 					return
 				case item := <-workQ:
-					if err := s.processItem(ctx, item, enqueue, batchQ); err != nil {
+					if err := s.processItem(ctx, item, dispatch, batchQ); err != nil {
 						s.recordErr(fmt.Errorf("process %q: %w", item.prefix, err))
 					}
 					if pending.Add(-1) == 0 {
@@ -151,7 +183,7 @@ func (s *Scanner) Run(ctx context.Context) error {
 		})
 	}
 
-	if !enqueue(workItem{prefix: "", depth: 0}) {
+	if !enqueueBlocking(workItem{prefix: "", depth: 0}) {
 		// ctx cancelled before the seed landed; workers will exit via
 		// ctx.Done and the writer below.
 	}
@@ -170,19 +202,22 @@ func (s *Scanner) Run(ctx context.Context) error {
 }
 
 // processItem dispatches one work item to either the recursive scanner
-// (at the depth cap) or the delimiter-probe routine.
-func (s *Scanner) processItem(ctx context.Context, item workItem, enqueue func(workItem) bool, batchQ chan<- radix.Batch) error {
+// (at the depth cap) or the delimiter-probe routine. The dispatch callback
+// is how sub-prefixes get scheduled; the same callback may invoke
+// processItem recursively for inline fallback when the queue is full.
+func (s *Scanner) processItem(ctx context.Context, item workItem, dispatch func(workItem) error, batchQ chan<- radix.Batch) error {
 	if item.depth >= s.maxDepth {
 		return s.listRecursive(ctx, batchQ, item.prefix)
 	}
-	return s.probeAndFanOut(ctx, item, enqueue, batchQ)
+	return s.probeAndFanOut(ctx, item, dispatch, batchQ)
 }
 
 // probeAndFanOut lists item.prefix with delimiter='/', emits every page's
-// Contents as a batch, and enqueues each discovered CommonPrefix one level
-// deeper. Returns once every page has been consumed and every sub-prefix
-// has been queued (enqueue is synchronous up to workQ buffer).
-func (s *Scanner) probeAndFanOut(ctx context.Context, item workItem, enqueue func(workItem) bool, batchQ chan<- radix.Batch) error {
+// Contents as a batch, and dispatches each discovered CommonPrefix one
+// level deeper. dispatch publishes to workQ when there's room, or runs
+// the sub-prefix inline otherwise — this is what prevents the deadlock
+// where every worker is blocked sending to a full queue.
+func (s *Scanner) probeAndFanOut(ctx context.Context, item workItem, dispatch func(workItem) error, batchQ chan<- radix.Batch) error {
 	slog.Debug("probe", "prefix", item.prefix, "depth", item.depth)
 	p := s3.NewListObjectsV2Paginator(s.s3, &s3.ListObjectsV2Input{
 		Bucket:    aws.String(s.bucket),
@@ -218,8 +253,8 @@ func (s *Scanner) probeAndFanOut(ctx context.Context, item workItem, enqueue fun
 			if sub == "" {
 				continue
 			}
-			if !enqueue(workItem{prefix: sub, depth: item.depth + 1}) {
-				return ctx.Err()
+			if err := dispatch(workItem{prefix: sub, depth: item.depth + 1}); err != nil {
+				return err
 			}
 		}
 	}
