@@ -1,0 +1,17 @@
+.DS_Store
+.vscode/
+
+# build outputs
+/s3du
+/s3du-export
+/s3du-rm
+
+# local test datasets
+test.list.txt
+test.objects.jsonl
+
+# profiling output
+profiles/
+
+# go test binaries left in cwd
+*.test
