@@ -24,7 +24,7 @@ Let's write a simple CLI which accounts S3DU of objects inside single S3 bucket.
 ### Problem
 
 Static -parallel-depth=3 discover + worker-leaf-scan split causes
-parallelism collapse at the long tail. Measured on <bucket> 50M-object
+parallelism collapse at the long tail. Measured on a 50M-object
 snapshot: scan completed in 28m10s · eff parallelism: avg 17.8/32
 (55%), final 1.4/32 (4%). One big sub-prefix below depth 3 lands on
 a single worker while 31 sit idle.

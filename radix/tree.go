@@ -11,7 +11,7 @@ import (
 // a per-subtree Aggregate cache. A subset of internals also carry a file
 // pointer for the rare case of an S3 directory-marker object whose key lies
 // at the exact boundary of this node (107 out of 24 M internals on the
-// 50 M-object <bucket> bucket).
+// 50 M-object reference bucket we benchmark against).
 //
 //	edge:     compressed path fragment from the parent node (empty only on root).
 //	children: child IDs, each tagged with leafTag if it points into the leaf arena.

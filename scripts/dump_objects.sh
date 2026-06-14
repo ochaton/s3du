@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-PROFILE="${PROFILE:-<profile>}"
-BUCKET="${BUCKET:-<bucket>}"
+: "${PROFILE:?set PROFILE=<aws-profile>}"
+: "${BUCKET:?set BUCKET=<bucket-name>}"
 MAX="${MAX:-50000}"
 OUT="${OUT:-test.objects.jsonl}"
 
