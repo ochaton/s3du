@@ -9,13 +9,11 @@ without re-paying the list cost.
 ## Install
 
 ```bash
-# Main binary
+# The browser
 go install github.com/ochaton/s3du@latest
 
-# Side binaries
-go install github.com/ochaton/s3du/cmd/s3du-rm@latest    # parallel batched delete by prefix
-go install github.com/ochaton/s3du/cmd/s3du-sim@latest   # offline strategy A/B against a snapshot
-go install github.com/ochaton/s3du/cmd/radix-bench@latest # microbench for the radix tree
+# Companion: parallel batched delete by prefix (the rm -rf for S3)
+go install github.com/ochaton/s3du/cmd/s3rmrf@latest
 ```
 
 Or build from source:

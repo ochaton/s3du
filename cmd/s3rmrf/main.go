@@ -1,4 +1,4 @@
-// s3du-rm: parallel batched DeleteObjects under a single non-empty prefix.
+// s3rmrf: parallel batched DeleteObjects under a single non-empty prefix.
 //
 // Pipeline:
 //
@@ -114,7 +114,7 @@ type objRef struct {
 
 func main() {
 	log.SetFlags(0)
-	log.SetPrefix("s3du-rm: ")
+	log.SetPrefix("s3rmrf: ")
 	log.SetOutput(stderr)
 
 	var o opts
