@@ -13,6 +13,7 @@ import (
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/aws/aws-sdk-go-v2/service/s3/types"
 
+	"github.com/ochaton/s3du/internal/progress"
 	"github.com/ochaton/s3du/radix"
 )
 
@@ -64,7 +65,7 @@ type Scanner struct {
 	workers  int
 
 	tree     *radix.Tree
-	progress *Progress
+	progress *progress.Progress
 
 	// firstErr captures the first error reported by any goroutine. Set via
 	// CompareAndSwap so writers stay race-free; reads see a stable value
@@ -82,14 +83,14 @@ type workItem struct {
 }
 
 // NewScanner constructs a Scanner. The caller owns tree and progress.
-func NewScanner(client *s3.Client, bucket string, workers, maxDepth int, tree *radix.Tree, progress *Progress) *Scanner {
+func NewScanner(client *s3.Client, bucket string, workers, maxDepth int, tree *radix.Tree, prog *progress.Progress) *Scanner {
 	return &Scanner{
 		s3:       client,
 		bucket:   bucket,
 		maxDepth: maxDepth,
 		workers:  workers,
 		tree:     tree,
-		progress: progress,
+		progress: prog,
 	}
 }
 
@@ -239,16 +240,16 @@ func (s *Scanner) probeAndFanOut(ctx context.Context, item workItem, dispatch fu
 	// scanned prefix verbatim.
 	prevKey := strings.TrimSuffix(item.prefix, "/")
 	for p.HasMorePages() {
-		start := s.progress.beginRequest()
+		start := s.progress.BeginRequest()
 		page, err := p.NextPage(ctx)
-		s.progress.endRequest(start)
+		s.progress.EndRequest(start)
 		if err != nil {
 			return err
 		}
 		if len(page.Contents) > 0 {
 			batch := makeBatch(prevKey, page.Contents)
 			logBatch("probe.batch", item.prefix, batch)
-			s.progress.observeBatch(batch.Objects)
+			s.progress.ObserveBatch(batch.Objects)
 			select {
 			case <-ctx.Done():
 				return ctx.Err()
@@ -280,9 +281,9 @@ func (s *Scanner) listRecursive(ctx context.Context, batchQ chan<- radix.Batch, 
 	})
 	prevKey := strings.TrimSuffix(prefix, "/")
 	for p.HasMorePages() {
-		start := s.progress.beginRequest()
+		start := s.progress.BeginRequest()
 		page, err := p.NextPage(ctx)
-		s.progress.endRequest(start)
+		s.progress.EndRequest(start)
 		if err != nil {
 			return err
 		}
@@ -291,7 +292,7 @@ func (s *Scanner) listRecursive(ctx context.Context, batchQ chan<- radix.Batch, 
 		}
 		batch := makeBatch(prevKey, page.Contents)
 		logBatch("listRecursive.batch", prefix, batch)
-		s.progress.observeBatch(batch.Objects)
+		s.progress.ObserveBatch(batch.Objects)
 		select {
 		case <-ctx.Done():
 			return ctx.Err()

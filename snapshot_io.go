@@ -11,6 +11,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/ochaton/s3du/internal/progress"
 	"github.com/ochaton/s3du/radix"
 )
 
@@ -60,7 +61,7 @@ func reportIO(w io.Writer, label string, counter *atomic.Int64, done <-chan stru
 				rate = float64(cur) / elapsed.Seconds()
 			}
 			fmt.Fprintf(w, "\r%s: %s in %s (avg %s)\033[K\n",
-				label, humanBytes(cur), elapsed.Round(time.Millisecond), humanRate(rate))
+				label, progress.HumanBytes(cur), elapsed.Round(time.Millisecond), progress.HumanRate(rate))
 			return
 		case <-tick.C:
 			cur := counter.Load()
@@ -68,7 +69,7 @@ func reportIO(w io.Writer, label string, counter *atomic.Int64, done <-chan stru
 			prev = cur
 			rate := float64(delta) / interval.Seconds()
 			fmt.Fprintf(w, "\r%s: %s  %s\033[K",
-				label, humanBytes(cur), humanRate(rate))
+				label, progress.HumanBytes(cur), progress.HumanRate(rate))
 		}
 	}
 }
@@ -94,7 +95,7 @@ func saveSnapshotWithProgress(tree *radix.Tree, path string, interval time.Durat
 	}()
 
 	cw := &countingWriter{w: f}
-	saveErr := runIOProgress("saving snapshot", &cw.bytes, 0, interval, func() error {
+	saveErr := progress.RunIO("saving snapshot", &cw.bytes, 0, interval, func() error {
 		return tree.Save(cw)
 	})
 	// Always attempt close — surface its error too, joined with any save
@@ -124,7 +125,7 @@ func loadSnapshotWithProgress(path string, interval time.Duration) (*radix.Tree,
 
 	cr := &countingReader{r: f}
 	var tree *radix.Tree
-	runErr := runIOProgress("loading snapshot", &cr.bytes, info.Size(), interval, func() error {
+	runErr := progress.RunIO("loading snapshot", &cr.bytes, info.Size(), interval, func() error {
 		var loadErr error
 		tree, loadErr = radix.Load(bufio.NewReaderSize(cr, 1<<20))
 		return loadErr
@@ -162,7 +163,7 @@ func printTreeStats(w io.Writer, tree *radix.Tree) {
 	fmt.Fprintf(w, "nodes with agg     : %d (%s)\n", s.NodesWithAgg, pct(s.NodesWithAgg, s.AliveNodes))
 	fmt.Fprintf(w, "*ClassByte allocs  : %d (%s of alive)\n", s.ClassBytePtrs, pct(s.ClassBytePtrs, s.AliveNodes))
 	fmt.Fprintf(w, "ClassBytes entries : len=%d  cap=%d  avg-per-agg=%s\n", s.ClassBytesLen, s.ClassBytesCap, avg(s.ClassBytesLen, s.NodesWithAgg))
-	fmt.Fprintf(w, "edge bytes (sum)   : %s  max=%d  avg=%s\n", humanBytes(s.EdgeBytes), s.MaxEdgeLen, avg(s.EdgeBytes, s.AliveNodes))
+	fmt.Fprintf(w, "edge bytes (sum)   : %s  max=%d  avg=%s\n", progress.HumanBytes(s.EdgeBytes), s.MaxEdgeLen, avg(s.EdgeBytes, s.AliveNodes))
 	fmt.Fprintf(w, "children slots(cap): %d  max=%d  avg=%s\n", s.ChildrenSlots, s.MaxChildrenCount, avg(s.ChildrenSlots, s.AliveNodes))
 
 	fmt.Fprintf(w, "\nedge-length histogram (bytes):\n")
@@ -178,13 +179,13 @@ func printTreeStats(w io.Writer, tree *radix.Tree) {
 	}
 
 	fmt.Fprintf(w, "\nestimated heap (allocator-rounded):\n")
-	fmt.Fprintf(w, "  nodes (arena)    : %s\n", humanBytes(s.EstHeapNodes))
-	fmt.Fprintf(w, "  edges            : %s\n", humanBytes(s.EstHeapEdges))
-	fmt.Fprintf(w, "  children slices  : %s\n", humanBytes(s.EstHeapChildren))
-	fmt.Fprintf(w, "  *ClassByte       : %s\n", humanBytes(s.EstHeapClassBytes))
-	fmt.Fprintf(w, "  *Aggregate hdr   : %s\n", humanBytes(s.EstHeapAggHeaders))
-	fmt.Fprintf(w, "  Aggregate.Bytes  : %s\n", humanBytes(s.EstHeapAggBytes))
-	fmt.Fprintf(w, "  TOTAL            : %s\n", humanBytes(s.EstHeapTotal))
+	fmt.Fprintf(w, "  nodes (arena)    : %s\n", progress.HumanBytes(s.EstHeapNodes))
+	fmt.Fprintf(w, "  edges            : %s\n", progress.HumanBytes(s.EstHeapEdges))
+	fmt.Fprintf(w, "  children slices  : %s\n", progress.HumanBytes(s.EstHeapChildren))
+	fmt.Fprintf(w, "  *ClassByte       : %s\n", progress.HumanBytes(s.EstHeapClassBytes))
+	fmt.Fprintf(w, "  *Aggregate hdr   : %s\n", progress.HumanBytes(s.EstHeapAggHeaders))
+	fmt.Fprintf(w, "  Aggregate.Bytes  : %s\n", progress.HumanBytes(s.EstHeapAggBytes))
+	fmt.Fprintf(w, "  TOTAL            : %s\n", progress.HumanBytes(s.EstHeapTotal))
 	if s.AliveNodes > 0 {
 		fmt.Fprintf(w, "  B / alive-node   : %.1f\n", float64(s.EstHeapTotal)/float64(s.AliveNodes))
 	}
@@ -197,7 +198,7 @@ func printTreeStats(w io.Writer, tree *radix.Tree) {
 	runtime.ReadMemStats(&m)
 	runtime.KeepAlive(tree)
 	fmt.Fprintf(w, "\nruntime.HeapAlloc  : %s   (estimate covers %s of it)\n",
-		humanBytes(int64(m.HeapAlloc)), pct(s.EstHeapTotal, int64(m.HeapAlloc)))
+		progress.HumanBytes(int64(m.HeapAlloc)), pct(s.EstHeapTotal, int64(m.HeapAlloc)))
 }
 
 // reportHeap prints a single stderr line with the current resident heap
@@ -210,8 +211,8 @@ func reportHeap(label string, nObjects int64) {
 	runtime.ReadMemStats(&m)
 	if nObjects > 0 {
 		fmt.Fprintf(os.Stderr, "%s heap=%s  (%.1f B/object across %d objects)\n",
-			label, humanBytes(int64(m.HeapAlloc)), float64(m.HeapAlloc)/float64(nObjects), nObjects)
+			label, progress.HumanBytes(int64(m.HeapAlloc)), float64(m.HeapAlloc)/float64(nObjects), nObjects)
 		return
 	}
-	fmt.Fprintf(os.Stderr, "%s heap=%s\n", label, humanBytes(int64(m.HeapAlloc)))
+	fmt.Fprintf(os.Stderr, "%s heap=%s\n", label, progress.HumanBytes(int64(m.HeapAlloc)))
 }

@@ -11,6 +11,7 @@ import (
 	"github.com/charmbracelet/lipgloss"
 
 	"github.com/ochaton/s3du/internal/pricing"
+	"github.com/ochaton/s3du/internal/progress"
 	"github.com/ochaton/s3du/radix"
 )
 
@@ -421,7 +422,7 @@ func (m *tuiModel) listingView() string {
 	totalObj, totalBytes, totalCost := dirTotals(m.entries, m.region)
 	b.WriteString("\n")
 	b.WriteString(dimStyle.Render(fmt.Sprintf("total: %d objects · %s · %s/mo",
-		totalObj, humanBytes(totalBytes), humanDollars(totalCost))))
+		totalObj, progress.HumanBytes(totalBytes), progress.HumanDollars(totalCost))))
 	b.WriteString("\n")
 	if cb := classBreakdown(m.entries); cb != "" {
 		b.WriteString(dimStyle.Render("classes: " + cb))
@@ -525,22 +526,22 @@ func (m *tuiModel) renderRow(e radix.Entry, nameWidth int, selected bool) string
 	if e.IsDir {
 		cost := dirCost(e.Aggregate.Bytes, m.region)
 		return fmt.Sprintf("%10s  %s  %s  %-19s  %10d  %10s",
-			humanBytes(bytes),
+			progress.HumanBytes(bytes),
 			visual,
 			namePadded,
 			dominantClassLabel(e.Aggregate.Bytes),
 			e.Aggregate.Objects,
-			humanDollars(cost),
+			progress.HumanDollars(cost),
 		)
 	}
 	cost := pricing.MonthlyStorage(e.Size, e.Class.String(), m.region)
 	return fmt.Sprintf("%10s  %s  %s  %-19s  %10s  %10s",
-		humanBytes(bytes),
+		progress.HumanBytes(bytes),
 		visual,
 		namePadded,
 		e.Class.String(),
 		"",
-		humanDollars(cost),
+		progress.HumanDollars(cost),
 	)
 }
 
@@ -730,7 +731,7 @@ func classBreakdown(entries []radix.Entry) string {
 	parts := make([]string, 0, len(classes))
 	for _, c := range classes {
 		t := totals[c]
-		parts = append(parts, fmt.Sprintf("%s: %d / %s", c.String(), t.objs, humanBytes(t.bytes)))
+		parts = append(parts, fmt.Sprintf("%s: %d / %s", c.String(), t.objs, progress.HumanBytes(t.bytes)))
 	}
 	return strings.Join(parts, " · ")
 }

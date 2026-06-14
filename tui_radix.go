@@ -7,6 +7,7 @@ import (
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
 
+	"github.com/ochaton/s3du/internal/progress"
 	"github.com/ochaton/s3du/radix"
 )
 
@@ -205,7 +206,7 @@ func renderNodeBlock(v radix.NodeView) string {
 			"        children=%d · agg.objects=%d · agg.bytes=%s · classes=%d",
 			v.NumChildren,
 			v.Aggregate.Objects,
-			humanBytes(v.Aggregate.Bytes.Total()),
+			progress.HumanBytes(v.Aggregate.Bytes.Total()),
 			len(v.Aggregate.Bytes),
 		)))
 		b.WriteString("\n")
@@ -219,7 +220,7 @@ func renderNodeBlock(v radix.NodeView) string {
 	} else {
 		b.WriteString(rxDimStyle.Render(fmt.Sprintf(
 			"        class=%s · size=%d (%s)",
-			v.Class.String(), v.Size, humanBytes(v.Size),
+			v.Class.String(), v.Size, progress.HumanBytes(v.Size),
 		)))
 		b.WriteString("\n")
 	}
@@ -238,7 +239,7 @@ func renderRadixRow(idx int, v radix.NodeView, nameWidth int) string {
 			nameWidth, edge,
 			v.Class.String(),
 			"",
-			humanBytes(v.Size),
+			progress.HumanBytes(v.Size),
 		)
 	}
 	label := dominantClassLabel(v.Aggregate.Bytes)
@@ -250,7 +251,7 @@ func renderRadixRow(idx int, v radix.NodeView, nameWidth int) string {
 		nameWidth, edge,
 		label,
 		v.Aggregate.Objects,
-		humanBytes(v.Aggregate.Bytes.Total()),
+		progress.HumanBytes(v.Aggregate.Bytes.Total()),
 	)
 }
 

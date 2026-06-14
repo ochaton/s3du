@@ -26,6 +26,7 @@ import (
 	smithylogging "github.com/aws/smithy-go/logging"
 
 	"github.com/ochaton/s3du/internal/pricing"
+	"github.com/ochaton/s3du/internal/progress"
 	"github.com/ochaton/s3du/radix"
 )
 
@@ -162,7 +163,7 @@ func acquireTree(ctx context.Context, o *opts) (*radix.Tree, error) {
 	}
 
 	tree := radix.New()
-	prog := NewProgress(o.region, o.workers)
+	prog := progress.New(o.region, o.workers)
 
 	// Progress dashboard is joined via WaitGroup so its final frame is
 	// fully torn down before the next stderr write. The EWMA sampler runs
@@ -173,13 +174,14 @@ func acquireTree(ctx context.Context, o *opts) (*radix.Tree, error) {
 	var reporterWG sync.WaitGroup
 	reporterWG.Go(func() {
 		if o.debug {
-			// runProgressUI normally owns the EWMA sampler; bypass it here.
-			stop := startSampler(prog, 250*time.Millisecond)
+			// progress.RunScanUI normally owns the EWMA sampler; bypass it
+			// here so structured slog logs share stderr without a TUI.
+			stop := progress.StartSampler(prog, 250*time.Millisecond)
 			defer stop()
-			runPlainReporter(os.Stderr, prog, done, o.progressEvery)
+			progress.RunPlainReporter(os.Stderr, prog, done, o.progressEvery)
 			return
 		}
-		runProgressUI(prog, done, 250*time.Millisecond, o.progressEvery)
+		progress.RunScanUI(prog, done, 250*time.Millisecond, o.progressEvery)
 	})
 
 	scanner := NewScanner(client, o.bucket, o.workers, o.maxDepth, tree, prog)
@@ -229,16 +231,16 @@ func printRootListing(tree *radix.Tree, region string) error {
 			fmt.Printf("%-40s %12d %15s %12s\n",
 				e.Name,
 				e.Aggregate.Objects,
-				humanBytes(e.Aggregate.Bytes.Total()),
-				humanDollars(dirCost(e.Aggregate.Bytes, region)),
+				progress.HumanBytes(e.Aggregate.Bytes.Total()),
+				progress.HumanDollars(dirCost(e.Aggregate.Bytes, region)),
 			)
 			continue
 		}
 		fmt.Printf("%-40s %12s %15s %12s\n",
 			e.Name,
 			"(file)",
-			humanBytes(e.Size),
-			humanDollars(pricing.MonthlyStorage(e.Size, e.Class.String(), region)),
+			progress.HumanBytes(e.Size),
+			progress.HumanDollars(pricing.MonthlyStorage(e.Size, e.Class.String(), region)),
 		)
 	}
 	return nil
