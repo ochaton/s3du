@@ -4,6 +4,8 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
+	"strings"
 	"sync"
 	"sync/atomic"
 
@@ -101,6 +103,13 @@ func (s *Scanner) Run(ctx context.Context) error {
 	wgWriter.Go(func() {
 		for b := range batchQ {
 			if err := s.tree.AddBatch(b); err != nil {
+				slog.Error("AddBatch failed",
+					"err", err,
+					"startFrom", b.StartFrom,
+					"len", len(b.Objects),
+					"first", firstKey(b.Objects),
+					"last", lastKey(b.Objects),
+				)
 				s.recordErr(fmt.Errorf("AddBatch: %w", err))
 			}
 		}
@@ -150,6 +159,7 @@ func (s *Scanner) Run(ctx context.Context) error {
 // each level it forwards Contents as batches and recurses into
 // CommonPrefixes. At parallelDepth it enqueues the prefix for the workers.
 func (s *Scanner) discover(ctx context.Context, workQ chan<- string, batchQ chan<- radix.Batch, prefix string, depth int) error {
+	slog.Debug("discover", "prefix", prefix, "depth", depth)
 	if depth >= s.parallelDepth {
 		select {
 		case <-ctx.Done():
@@ -164,10 +174,14 @@ func (s *Scanner) discover(ctx context.Context, workQ chan<- string, batchQ chan
 		Prefix:    aws.String(prefix),
 		Delimiter: slashStr,
 	})
-	// First page's StartFrom: any key starting with this prefix is strictly
-	// greater than the prefix string itself, so the prefix is a valid lex
-	// lower bound for radix.Batch's exclusive StartFrom contract.
-	prevKey := prefix
+	// First page's StartFrom: the prefix with any trailing '/' stripped.
+	// That value is strictly less than every key returned for this prefix
+	// — including the S3 directory-marker object whose key equals the
+	// prefix verbatim (a zero-byte object intentionally uploaded with the
+	// trailing slash). No key from a sibling prefix can fall into the
+	// resulting range because the byte immediately after a stripped slash
+	// is always > '/' (0x2F).
+	prevKey := strings.TrimSuffix(prefix, "/")
 	for p.HasMorePages() {
 		start := s.progress.beginRequest()
 		page, err := p.NextPage(ctx)
@@ -178,6 +192,7 @@ func (s *Scanner) discover(ctx context.Context, workQ chan<- string, batchQ chan
 
 		if len(page.Contents) > 0 {
 			batch := makeBatch(prevKey, page.Contents)
+			logBatch("discover.batch", prefix, batch)
 			s.progress.observeBatch(batch.Objects)
 			select {
 			case <-ctx.Done():
@@ -202,11 +217,12 @@ func (s *Scanner) discover(ctx context.Context, workQ chan<- string, batchQ chan
 // listRecursive performs a paginated, delimiter-less ListObjectsV2 over a
 // single leaf prefix and forwards each page as a radix.Batch.
 func (s *Scanner) listRecursive(ctx context.Context, batchQ chan<- radix.Batch, prefix string) error {
+	slog.Debug("listRecursive", "prefix", prefix)
 	p := s3.NewListObjectsV2Paginator(s.s3, &s3.ListObjectsV2Input{
 		Bucket: aws.String(s.bucket),
 		Prefix: aws.String(prefix),
 	})
-	prevKey := prefix
+	prevKey := strings.TrimSuffix(prefix, "/")
 	for p.HasMorePages() {
 		start := s.progress.beginRequest()
 		page, err := p.NextPage(ctx)
@@ -218,6 +234,7 @@ func (s *Scanner) listRecursive(ctx context.Context, batchQ chan<- radix.Batch, 
 			continue
 		}
 		batch := makeBatch(prevKey, page.Contents)
+		logBatch("listRecursive.batch", prefix, batch)
 		s.progress.observeBatch(batch.Objects)
 		select {
 		case <-ctx.Done():
@@ -229,6 +246,21 @@ func (s *Scanner) listRecursive(ctx context.Context, batchQ chan<- radix.Batch, 
 	return nil
 }
 
+// logBatch emits a Debug-level structured log entry summarising a batch
+// destined for the writer. Cheap when the slog level is above Debug.
+func logBatch(event, prefix string, b radix.Batch) {
+	if len(b.Objects) == 0 {
+		return
+	}
+	slog.Debug(event,
+		"prefix", prefix,
+		"startFrom", b.StartFrom,
+		"first", b.Objects[0].Key,
+		"last", b.Objects[len(b.Objects)-1].Key,
+		"len", len(b.Objects),
+	)
+}
+
 // recordErr captures the first non-nil error and cancels the shared
 // context so peer goroutines see ctx.Done() and exit promptly.
 func (s *Scanner) recordErr(err error) {
@@ -238,6 +270,21 @@ func (s *Scanner) recordErr(err error) {
 	if s.firstErr.CompareAndSwap(nil, &err) {
 		s.cancel()
 	}
+}
+
+// firstKey / lastKey are small helpers used only by the AddBatch error log.
+func firstKey(objs []radix.Object) string {
+	if len(objs) == 0 {
+		return ""
+	}
+	return objs[0].Key
+}
+
+func lastKey(objs []radix.Object) string {
+	if len(objs) == 0 {
+		return ""
+	}
+	return objs[len(objs)-1].Key
 }
 
 // makeBatch converts an S3 page's Contents into a radix.Batch with the

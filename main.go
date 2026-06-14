@@ -8,6 +8,7 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"log/slog"
 	"os"
 	"os/signal"
 	"path/filepath"
@@ -37,6 +38,7 @@ type opts struct {
 	snapshotPath  string
 	loadOnly      bool
 	interactive   bool
+	debug         bool
 	progressEvery time.Duration
 }
 
@@ -51,8 +53,10 @@ func main() {
 	flag.StringVar(&o.snapshotPath, "snapshot", "", "path to write/read the binary tree snapshot (defaults to ~/.cache/s3du/<bucket>@<region>/tree.snap)")
 	flag.BoolVar(&o.loadOnly, "load", false, "skip scanning, load the snapshot from -snapshot and continue (e.g., launch TUI)")
 	flag.BoolVar(&o.interactive, "i", false, "launch the bubbletea TUI after the scan finishes")
+	flag.BoolVar(&o.debug, "debug", false, "verbose structured logging to stderr; disables the live progress dashboard")
 	flag.Parse()
 	o.progressEvery = time.Duration(*progressMs) * time.Millisecond
+	configureLogging(o.debug)
 
 	if err := run(o); err != nil {
 		fmt.Fprintln(os.Stderr, "s3du:", err)
@@ -118,9 +122,18 @@ func acquireTree(ctx context.Context, o *opts) (*radix.Tree, error) {
 	// Progress dashboard is joined via WaitGroup so its final frame is
 	// fully torn down before the next stderr write. The EWMA sampler runs
 	// on a fixed cadence inside runProgressUI regardless of UI refresh.
+	// With -debug, structured logs already share stderr, so we skip the
+	// bubbletea dashboard and let slog have stderr to itself.
 	done := make(chan struct{})
 	var reporterWG sync.WaitGroup
 	reporterWG.Go(func() {
+		if o.debug {
+			// runProgressUI normally owns the EWMA sampler; bypass it here.
+			stop := startSampler(prog, 250*time.Millisecond)
+			defer stop()
+			runPlainReporter(os.Stderr, prog, done, o.progressEvery)
+			return
+		}
 		runProgressUI(prog, done, 250*time.Millisecond, o.progressEvery)
 	})
 
@@ -182,6 +195,17 @@ func printRootListing(tree *radix.Tree, region string) error {
 		)
 	}
 	return nil
+}
+
+// configureLogging installs slog's default logger writing to stderr at
+// Info level (Debug when -debug is set). The scanner's hot-path log calls
+// are at Debug, so they stay silent unless -debug is requested.
+func configureLogging(debug bool) {
+	level := slog.LevelInfo
+	if debug {
+		level = slog.LevelDebug
+	}
+	slog.SetDefault(slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: level})))
 }
 
 // defaultSnapshotPath returns ~/.cache/s3du/<bucket>@<region>/tree.snap.
