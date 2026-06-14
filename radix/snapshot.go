@@ -133,7 +133,7 @@ func (t *Tree) Save(w io.Writer) error {
 			fi++
 			continue
 		}
-		if err := writeInternalRecord(bw, intDiskID[id], t.atInternal(id), mapChild); err != nil {
+		if err := t.writeInternalRecord(bw, intDiskID[id], t.atInternal(id), mapChild); err != nil {
 			return fmt.Errorf("radix: write internal %d: %w", id, err)
 		}
 	}
@@ -143,7 +143,7 @@ func (t *Tree) Save(w io.Writer) error {
 			fl++
 			continue
 		}
-		if err := writeLeafRecord(bw, leafDiskID[id], t.atLeaf(id)); err != nil {
+		if err := t.writeLeafRecord(bw, leafDiskID[id], t.atLeaf(id)); err != nil {
 			return fmt.Errorf("radix: write leaf %d: %w", id, err)
 		}
 	}
@@ -194,8 +194,10 @@ func Load(r io.Reader) (*Tree, error) {
 
 		isLeaf := rec.id != 0 && rec.file != nil && len(rec.children) == 0 && rec.agg == nil
 		if isLeaf {
+			off, length := t.allocEdge(rec.edge)
 			cid := t.allocLeaf(leaf{
-				edge:      rec.edge,
+				edgeOff:   off,
+				edgeLen:   length,
 				sizeClass: packSizeClass(rec.file.Class, rec.file.Size),
 			})
 			diskToCID[rec.id] = cid
@@ -209,8 +211,10 @@ func Load(r io.Reader) (*Tree, error) {
 		} else {
 			memID = t.allocInternal(internal{})
 		}
+		off, length := t.allocEdge(rec.edge)
 		n := t.atInternal(memID)
-		n.edge = rec.edge
+		n.edgeOff = off
+		n.edgeLen = length
 		n.file = rec.file
 		n.agg = rec.agg
 		n.children = rec.children // disk IDs; rewritten below
@@ -291,7 +295,7 @@ func (t *Tree) Export(yield func(Object) bool) {
 
 func (t *Tree) exportFromInternal(id uint32, prefix string, yield func(Object) bool) bool {
 	n := t.atInternal(id)
-	fullKey := prefix + n.edge
+	fullKey := prefix + t.edgeStr(n.edgeOff, n.edgeLen)
 	if n.file != nil {
 		if !yield(Object{Key: fullKey, Size: n.file.Size, Class: n.file.Class}) {
 			return false
@@ -300,7 +304,7 @@ func (t *Tree) exportFromInternal(id uint32, prefix string, yield func(Object) b
 	for _, cid := range n.children {
 		if isLeafID(cid) {
 			lf := t.atLeaf(cid & idMask)
-			if !yield(Object{Key: fullKey + lf.edge, Size: lf.size(), Class: lf.class()}) {
+			if !yield(Object{Key: fullKey + t.edgeStr(lf.edgeOff, lf.edgeLen), Size: lf.size(), Class: lf.class()}) {
 				return false
 			}
 			continue
@@ -345,7 +349,7 @@ func readHeader(r io.Reader) (maxID, aliveCount uint32, err error) {
 
 // writeInternalRecord serialises an internal node as a v1-format record,
 // rewriting child references through mapChild so they refer to disk IDs.
-func writeInternalRecord(w *bufio.Writer, id uint32, n *internal, mapChild func(uint32) uint32) error {
+func (t *Tree) writeInternalRecord(w *bufio.Writer, id uint32, n *internal, mapChild func(uint32) uint32) error {
 	var flags uint8
 	if n.file != nil {
 		flags |= snapFlagHasFile
@@ -356,13 +360,17 @@ func writeInternalRecord(w *bufio.Writer, id uint32, n *internal, mapChild func(
 	var hdr [9]byte
 	binary.LittleEndian.PutUint32(hdr[0:4], id)
 	hdr[4] = flags
-	binary.LittleEndian.PutUint16(hdr[5:7], uint16(len(n.edge)))
+	binary.LittleEndian.PutUint16(hdr[5:7], uint16(n.edgeLen))
 	binary.LittleEndian.PutUint16(hdr[7:9], uint16(len(n.children)))
 	if _, err := w.Write(hdr[:]); err != nil {
 		return err
 	}
-	if _, err := w.WriteString(n.edge); err != nil {
-		return err
+	if n.edgeLen > 0 {
+		chunk := n.edgeOff >> edgeChunkBits
+		within := n.edgeOff & edgeChunkMask
+		if _, err := w.Write(t.edgeArena[chunk][within : within+n.edgeLen]); err != nil {
+			return err
+		}
 	}
 	if len(n.children) > 0 {
 		var tmp [4]byte
@@ -403,17 +411,21 @@ func writeInternalRecord(w *bufio.Writer, id uint32, n *internal, mapChild func(
 // writeLeafRecord serialises a leaf as a v1-format record (no children, no
 // agg, hasFile). The packed sizeClass is unpacked back into (class, size)
 // for on-disk compatibility.
-func writeLeafRecord(w *bufio.Writer, id uint32, l *leaf) error {
+func (t *Tree) writeLeafRecord(w *bufio.Writer, id uint32, l *leaf) error {
 	var hdr [9]byte
 	binary.LittleEndian.PutUint32(hdr[0:4], id)
 	hdr[4] = snapFlagHasFile
-	binary.LittleEndian.PutUint16(hdr[5:7], uint16(len(l.edge)))
+	binary.LittleEndian.PutUint16(hdr[5:7], uint16(l.edgeLen))
 	binary.LittleEndian.PutUint16(hdr[7:9], 0)
 	if _, err := w.Write(hdr[:]); err != nil {
 		return err
 	}
-	if _, err := w.WriteString(l.edge); err != nil {
-		return err
+	if l.edgeLen > 0 {
+		chunk := l.edgeOff >> edgeChunkBits
+		within := l.edgeOff & edgeChunkMask
+		if _, err := w.Write(t.edgeArena[chunk][within : within+l.edgeLen]); err != nil {
+			return err
+		}
 	}
 	var fb [9]byte
 	fb[0] = uint8(l.class())
