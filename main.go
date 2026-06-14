@@ -97,11 +97,12 @@ func run(o opts) error {
 // resolved it from the environment so cost calculations match the scan.
 func acquireTree(ctx context.Context, o *opts) (*radix.Tree, error) {
 	if o.loadOnly {
-		tree, err := radix.LoadFile(o.snapshotPath)
+		tree, err := loadSnapshotWithProgress(o.snapshotPath, 250*time.Millisecond)
 		if err != nil {
 			return nil, fmt.Errorf("load %s: %w", o.snapshotPath, err)
 		}
-		fmt.Fprintf(os.Stderr, "loaded snapshot %s\n", o.snapshotPath)
+		nObjs := countTreeObjects(tree)
+		reportHeap("loaded snapshot", nObjs)
 		return tree, nil
 	}
 
@@ -156,11 +157,21 @@ func acquireTree(ctx context.Context, o *opts) (*radix.Tree, error) {
 		int(final.InflightEWMA*100/float64(max(final.MaxWorkers, 1))),
 	)
 
-	if err := tree.SaveFile(o.snapshotPath); err != nil {
+	if err := saveSnapshotWithProgress(tree, o.snapshotPath, 250*time.Millisecond); err != nil {
 		return nil, fmt.Errorf("save snapshot %s: %w", o.snapshotPath, err)
 	}
 	fmt.Fprintf(os.Stderr, "snapshot saved to %s\n", o.snapshotPath)
+	reportHeap("post-scan", int64(final.ObjectsSeen))
 	return tree, nil
+}
+
+// countTreeObjects walks the loaded tree to recover the object count for
+// reporting. Tree.Export iterates leaves in lex order; counting is a
+// constant-time-per-leaf walk over already-resident memory.
+func countTreeObjects(tree *radix.Tree) int64 {
+	var n int64
+	tree.Export(func(radix.Object) bool { n++; return true })
+	return n
 }
 
 // printRootListing prints the top-level directory listing along with per-
