@@ -7,7 +7,6 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
-	"sync"
 	"sync/atomic"
 	"time"
 
@@ -74,11 +73,9 @@ func reportIO(w io.Writer, label string, counter *atomic.Int64, done <-chan stru
 }
 
 // saveSnapshotWithProgress writes tree to path atomically (via "*.tmp" +
-// rename, parent dirs created if missing) while streaming a bytes-written
-// progress line to stderr. The radix package's own SaveFile does the same
-// atomic dance but without the UI; this variant exists because save in
-// s3du can take many seconds on multi-gigabyte snapshots and the user
-// needs feedback.
+// rename, parent dirs created if missing) while a bubbletea dashboard
+// tracks bytes written and rate on stderr. Save size is not known in
+// advance, so the dashboard renders rate/elapsed only — no ETA.
 func saveSnapshotWithProgress(tree *radix.Tree, path string, interval time.Duration) (err error) {
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
 		return err
@@ -88,9 +85,7 @@ func saveSnapshotWithProgress(tree *radix.Tree, path string, interval time.Durat
 	if err != nil {
 		return err
 	}
-	cleanup := func() {
-		_ = os.Remove(tmp)
-	}
+	cleanup := func() { _ = os.Remove(tmp) }
 	defer func() {
 		if err != nil {
 			cleanup()
@@ -98,13 +93,9 @@ func saveSnapshotWithProgress(tree *radix.Tree, path string, interval time.Durat
 	}()
 
 	cw := &countingWriter{w: f}
-	done := make(chan struct{})
-	var wg sync.WaitGroup
-	wg.Go(func() { reportIO(os.Stderr, "saving snapshot", &cw.bytes, done, interval) })
-
-	saveErr := tree.Save(cw)
-	close(done)
-	wg.Wait()
+	saveErr := runIOProgress("saving snapshot", &cw.bytes, 0, interval, func() error {
+		return tree.Save(cw)
+	})
 	if saveErr != nil {
 		_ = f.Close()
 		return saveErr
@@ -115,27 +106,33 @@ func saveSnapshotWithProgress(tree *radix.Tree, path string, interval time.Durat
 	return os.Rename(tmp, path)
 }
 
-// loadSnapshotWithProgress reads a snapshot from path and reports the
-// bytes-read rate to stderr while doing so. The reported rate is the read
-// throughput from the buffered reader, not the underlying disk — when the
-// file is in the page cache the visible numbers shoot up accordingly.
+// loadSnapshotWithProgress reads a snapshot from path with a bubbletea
+// progress UI on stderr. The file's on-disk size feeds the percent bar
+// and the ETA estimate; the rate is an EWMA of bytes-read per tick. When
+// the file is in the page cache the reported numbers spike since the
+// counter measures buffered-read throughput, not disk I/O.
 func loadSnapshotWithProgress(path string, interval time.Duration) (*radix.Tree, error) {
+	info, statErr := os.Stat(path)
+	if statErr != nil {
+		return nil, statErr
+	}
 	f, err := os.Open(path)
 	if err != nil {
 		return nil, err
 	}
 	defer f.Close()
-	// Wrap directly around the file so the counter sees the actual disk
-	// reads; radix.Load's internal bufio sits on top and amplifies bytes
-	// across many small Read calls into one large file read per refill.
+
 	cr := &countingReader{r: f}
-	done := make(chan struct{})
-	var wg sync.WaitGroup
-	wg.Go(func() { reportIO(os.Stderr, "loading snapshot", &cr.bytes, done, interval) })
-	tree, err := radix.Load(bufio.NewReaderSize(cr, 1<<20))
-	close(done)
-	wg.Wait()
-	return tree, err
+	var tree *radix.Tree
+	runErr := runIOProgress("loading snapshot", &cr.bytes, info.Size(), interval, func() error {
+		var loadErr error
+		tree, loadErr = radix.Load(bufio.NewReaderSize(cr, 1<<20))
+		return loadErr
+	})
+	if runErr != nil {
+		return nil, runErr
+	}
+	return tree, nil
 }
 
 // printTreeStats dumps the arena occupancy and per-component heap accounting
