@@ -3,6 +3,7 @@ package main
 import (
 	"fmt"
 	"io"
+	"log/slog"
 	"os"
 	"time"
 
@@ -38,7 +39,9 @@ func runProgressUI(p *Progress, done <-chan struct{}, sampleInterval, uiInterval
 		<-done
 		tp.Quit()
 	}()
-	_, _ = tp.Run()
+	if _, err := tp.Run(); err != nil {
+		slog.Warn("progress UI exited with error", "err", err)
+	}
 }
 
 // startSampler runs Progress.sampleInflight on a fixed cadence and returns

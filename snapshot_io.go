@@ -2,6 +2,7 @@ package main
 
 import (
 	"bufio"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -96,12 +97,11 @@ func saveSnapshotWithProgress(tree *radix.Tree, path string, interval time.Durat
 	saveErr := runIOProgress("saving snapshot", &cw.bytes, 0, interval, func() error {
 		return tree.Save(cw)
 	})
-	if saveErr != nil {
-		_ = f.Close()
-		return saveErr
-	}
-	if err = f.Close(); err != nil {
-		return err
+	// Always attempt close — surface its error too, joined with any save
+	// error so neither is silently swallowed.
+	closeErr := f.Close()
+	if saveErr != nil || closeErr != nil {
+		return errors.Join(saveErr, closeErr)
 	}
 	return os.Rename(tmp, path)
 }

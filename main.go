@@ -25,6 +25,7 @@ import (
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 	smithylogging "github.com/aws/smithy-go/logging"
 
+	"github.com/ochaton/s3du/internal/pricing"
 	"github.com/ochaton/s3du/radix"
 )
 
@@ -66,7 +67,7 @@ func main() {
 	flag.BoolVar(&o.debugTree, "debug-tree", false, "launch the radix-internals TUI (raw nodes, edges, CIDs) instead of the directory browser; implies -i")
 	flag.Parse()
 	o.progressEvery = time.Duration(*progressMs) * time.Millisecond
-	logFile, err := configureLogging(o.debug, o.logPath, o.bucket, o.region)
+	logFile, err := configureLogging(o.debug, o.logPath)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "s3du: log setup:", err)
 		os.Exit(1)
@@ -237,7 +238,7 @@ func printRootListing(tree *radix.Tree, region string) error {
 			e.Name,
 			"(file)",
 			humanBytes(e.Size),
-			humanDollars(monthlyStorageCost(e.Size, e.Class.String(), region)),
+			humanDollars(pricing.MonthlyStorage(e.Size, e.Class.String(), region)),
 		)
 	}
 	return nil
@@ -251,13 +252,13 @@ func printRootListing(tree *radix.Tree, region string) error {
 // uncluttered and no disk is consumed. With -debug, slog writes to stderr
 // at Debug level (and TUI is disabled in that mode). When both -log and
 // -debug are set, slog writes to both file and stderr.
-func configureLogging(debug bool, logPath, bucket, region string) (*os.File, error) {
+func configureLogging(debug bool, logPath string) (*os.File, error) {
 	level := slog.LevelDebug
 
 	var writers []io.Writer
 	var file *os.File
 
-	if path := resolveLogPath(logPath, bucket, region); path != "" {
+	if path := resolveLogPath(logPath); path != "" {
 		if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
 			return nil, fmt.Errorf("create log dir %q: %w", filepath.Dir(path), err)
 		}
@@ -292,7 +293,7 @@ func configureLogging(debug bool, logPath, bucket, region string) (*os.File, err
 // resolveLogPath returns the file the structured log should be written to,
 // or "" to skip file logging. Only honours the explicit -log flag — file
 // logging is off by default to avoid spamming disk on every run.
-func resolveLogPath(explicit, bucket, region string) string {
+func resolveLogPath(explicit string) string {
 	return explicit
 }
 

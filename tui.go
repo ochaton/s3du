@@ -5,12 +5,29 @@ import (
 	"fmt"
 	"slices"
 	"strings"
+	"unicode/utf8"
 
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
 
+	"github.com/ochaton/s3du/internal/pricing"
 	"github.com/ochaton/s3du/radix"
 )
+
+// truncate shrinks s to at most width grapheme-ish columns, replacing the
+// trailing characters with "…" when it had to cut. Uses rune counts (not
+// bytes) so multi-byte UTF-8 keys (rare in S3 but possible) never get
+// sliced mid-character.
+func truncate(s string, width int) string {
+	if utf8.RuneCountInString(s) <= width {
+		return s
+	}
+	if width <= 1 {
+		return "…"
+	}
+	runes := []rune(s)
+	return string(runes[:width-1]) + "…"
+}
 
 // runTUI launches the bubbletea browser over an already-built radix.Tree.
 func runTUI(tree *radix.Tree, region string) error {
@@ -204,7 +221,7 @@ func entryCost(e radix.Entry, region string) float64 {
 	if e.IsDir {
 		return dirCost(e.Aggregate.Bytes, region)
 	}
-	return monthlyStorageCost(e.Size, e.Class.String(), region)
+	return pricing.MonthlyStorage(e.Size, e.Class.String(), region)
 }
 
 func (m *tuiModel) Init() tea.Cmd { return nil }
@@ -491,9 +508,7 @@ func (m *tuiModel) renderRow(e radix.Entry, nameWidth int, selected bool) string
 	if !e.IsDir && name == "" {
 		name = "."
 	}
-	if len(name) > nameWidth {
-		name = name[:nameWidth-1] + "…"
-	}
+	name = truncate(name, nameWidth)
 	// Pad name to its fixed column width first; only THEN apply the style
 	// so the highlight (or bold-dir) spans the full column.
 	namePadded := fmt.Sprintf("%-*s", nameWidth, name)
@@ -518,7 +533,7 @@ func (m *tuiModel) renderRow(e radix.Entry, nameWidth int, selected bool) string
 			humanDollars(cost),
 		)
 	}
-	cost := monthlyStorageCost(e.Size, e.Class.String(), m.region)
+	cost := pricing.MonthlyStorage(e.Size, e.Class.String(), m.region)
 	return fmt.Sprintf("%10s  %s  %s  %-19s  %10s  %10s",
 		humanBytes(bytes),
 		visual,
@@ -664,7 +679,7 @@ func dominantClassLabel(b radix.ClassBytes) string {
 func dirCost(b radix.ClassBytes, region string) float64 {
 	var total float64
 	for _, kv := range b {
-		total += monthlyStorageCost(kv.Size, kv.Class.String(), region)
+		total += pricing.MonthlyStorage(kv.Size, kv.Class.String(), region)
 	}
 	return total
 }
@@ -672,34 +687,36 @@ func dirCost(b radix.ClassBytes, region string) float64 {
 // classBreakdown sums objects and bytes per storage class across every entry
 // in the listing (directories and files alike) and returns a single-line
 // compact summary like "GLACIER_IR: 49998 objs / 106.8 GiB · STANDARD: 2".
+//
+// Per-class object counts aren't tracked on radix Aggregates today, so for
+// directory entries we attribute the entire Aggregate.Objects to the
+// directory's dominant class only — other classes contribute bytes but no
+// objects. Not perfect but consistent and easy to read.
 func classBreakdown(entries []radix.Entry) string {
-	totals := map[radix.StorageClass]struct {
-		objs  int64
-		bytes int64
-	}{}
+	type bucket struct {
+		objs, bytes int64
+	}
+	totals := map[radix.StorageClass]*bucket{}
+	at := func(c radix.StorageClass) *bucket {
+		b, ok := totals[c]
+		if !ok {
+			b = &bucket{}
+			totals[c] = b
+		}
+		return b
+	}
 	for _, e := range entries {
 		if e.IsDir {
-			// Aggregate.Bytes lists the per-class byte totals across the
-			// subtree; the per-class object counts are not tracked
-			// separately so we attribute every dir's Objects to its
-			// dominant class. Not perfect but readable.
 			top := dominantClassFor(e.Aggregate.Bytes)
-			t := totals[top]
-			t.objs += e.Aggregate.Objects
+			at(top).objs += e.Aggregate.Objects
 			for _, kv := range e.Aggregate.Bytes {
-				bucket := totals[kv.Class]
-				bucket.bytes += kv.Size
-				if kv.Class == top {
-					bucket.objs = t.objs
-				}
-				totals[kv.Class] = bucket
+				at(kv.Class).bytes += kv.Size
 			}
 			continue
 		}
-		b := totals[e.Class]
+		b := at(e.Class)
 		b.objs++
 		b.bytes += e.Size
-		totals[e.Class] = b
 	}
 	if len(totals) == 0 {
 		return ""
@@ -750,7 +767,7 @@ func dirTotals(entries []radix.Entry, region string) (int64, int64, float64) {
 		}
 		objs++
 		bytes += e.Size
-		cost += monthlyStorageCost(e.Size, e.Class.String(), region)
+		cost += pricing.MonthlyStorage(e.Size, e.Class.String(), region)
 	}
 	return objs, bytes, cost
 }

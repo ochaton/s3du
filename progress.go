@@ -6,6 +6,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/ochaton/s3du/internal/pricing"
 	"github.com/ochaton/s3du/radix"
 )
 
@@ -215,19 +216,18 @@ func (p *Progress) Snapshot() ProgressSnapshot {
 // ListCost returns the cumulative LIST cost in dollars at the snapshot
 // time, using regional per-1000-request pricing.
 func (s ProgressSnapshot) ListCost() float64 {
-	return computeCost(s.ListRequests, s.Region)
+	return pricing.ListCost(s.ListRequests, s.Region)
 }
 
 // MonthlyStorageCost returns the per-month storage cost summed over all
 // observed classes.
 func (s ProgressSnapshot) MonthlyStorageCost() float64 {
 	var total float64
-	for class := range numStorageClasses {
-		bytes := s.BytesByClass[class]
+	for class, bytes := range s.BytesByClass {
 		if bytes == 0 {
 			continue
 		}
-		total += monthlyStorageCost(bytes, radix.StorageClass(class).String(), s.Region)
+		total += pricing.MonthlyStorage(bytes, radix.StorageClass(class).String(), s.Region)
 	}
 	return total
 }

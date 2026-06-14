@@ -118,12 +118,10 @@ func (m *radixModel) ascend() {
 
 var (
 	rxHeaderStyle = lipgloss.NewStyle().Bold(true)
-	rxRowStyle    = lipgloss.NewStyle()
 	rxSelStyle    = lipgloss.NewStyle().Reverse(true)
 	rxIntStyle    = lipgloss.NewStyle().Bold(true)
 	rxLeafStyle   = lipgloss.NewStyle()
 	rxDimStyle    = lipgloss.NewStyle().Faint(true)
-	rxErrStyle    = lipgloss.NewStyle().Foreground(lipgloss.Color("9"))
 	rxHelpHint    = "↑/↓ move · Enter/l descend · Backspace/h up · q quit"
 )
 
@@ -186,10 +184,7 @@ func edgeLabel(e string) string {
 	if e == "" {
 		return "<root>"
 	}
-	if len(e) > 24 {
-		return fmt.Sprintf("%q…", e[:23])
-	}
-	return fmt.Sprintf("%q", e)
+	return truncate(fmt.Sprintf("%q", e), 24)
 }
 
 // renderNodeBlock prints a few lines summarising the current node (the one
@@ -232,14 +227,11 @@ func renderNodeBlock(v radix.NodeView) string {
 }
 
 func renderRadixRow(idx int, v radix.NodeView, nameWidth int) string {
-	edge := v.Edge
-	if len(edge) > nameWidth {
-		edge = edge[:nameWidth-1] + "…"
-	}
-	edge = fmt.Sprintf("%q", edge)
-	if len(edge) > nameWidth {
-		edge = edge[:nameWidth-1] + "…"
-	}
+	// Quote BEFORE truncating: the %q escaping can change a string's
+	// rendered width, so applying truncate to the quoted form keeps the
+	// column aligned. truncate is rune-aware (not byte-aware) so multi-
+	// byte UTF-8 edges never split a code point.
+	edge := truncate(fmt.Sprintf("%q", v.Edge), nameWidth)
 	if v.Kind == radix.NodeLeaf {
 		return fmt.Sprintf("%5d  0x%08x  %-4s  %-*s  %-19s  %10s  %10s",
 			idx, v.CID, "leaf",
