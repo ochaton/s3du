@@ -24,7 +24,6 @@ type internal struct {
 	edgeLen  uint32
 	children []uint32
 	agg      *Aggregate
-	file     *ClassByte
 }
 
 // leaf is a terminal radix-tree node — a single S3 object's metadata.
@@ -76,19 +75,21 @@ const (
 	edgeChunkMask = edgeChunkSize - 1
 )
 
-// effectiveAgg returns the aggregate over the subtree rooted at this internal.
-// When no Aggregate has been materialised the value is derived from the
-// dir-marker file (if any), keeping freshly-created empty internals zero-cost.
-func (n *internal) effectiveAgg() Aggregate {
+// internalAgg returns the aggregate over the subtree rooted at the internal
+// with the given untagged ID. When no Aggregate has been materialised the
+// value is derived from the dir-marker file (if any) so freshly-created
+// empty internals stay zero-cost.
+func (t *Tree) internalAgg(id uint32) Aggregate {
+	n := t.atInternal(id)
 	if n.agg != nil {
 		return *n.agg
 	}
-	if n.file == nil {
-		return Aggregate{}
+	if cb, ok := t.dirMarker(id); ok {
+		a := Aggregate{Objects: 1}
+		a.Bytes.Add(cb.Class, cb.Size)
+		return a
 	}
-	a := Aggregate{Objects: 1}
-	a.Bytes.Add(n.file.Class, n.file.Size)
-	return a
+	return Aggregate{}
 }
 
 // leafAggregate returns the Aggregate a leaf contributes to its ancestors.
@@ -103,7 +104,7 @@ func (l *leaf) effectiveAgg() Aggregate {
 // insert. Callers that just need the total object count or the per-class
 // bytes should use this instead of walking Export.
 func (t *Tree) RootAggregate() Aggregate {
-	return t.atInternal(rootID).effectiveAgg()
+	return t.internalAgg(rootID)
 }
 
 // Tree is an in-memory compressed radix tree over S3 object keys.
@@ -132,9 +133,34 @@ type Tree struct {
 	// edgeArena holds the contiguous backing bytes for every node's edge.
 	// Each chunk is exactly edgeChunkSize bytes once allocated. Edges are
 	// addressed by a 32-bit value: (chunkIdx << edgeChunkBits) | within.
-	edgeArena   [][]byte
-	edgeWithin  uint32 // bytes written into the current (last) chunk
+	edgeArena     [][]byte
+	edgeWithin    uint32 // bytes written into the current (last) chunk
 	edgeChunkBase uint32 // (chunkIdx << edgeChunkBits) of the current chunk
+
+	// dirMarkers holds the (class, size) of S3 directory-marker objects
+	// pinned at internal nodes. Sparse: typically 0–1000 entries even on
+	// 50 M-object buckets. Keyed by internal arena ID.
+	dirMarkers map[uint32]ClassByte
+}
+
+// dirMarker returns the dir-marker file pinned at the internal with the
+// given untagged ID, if any.
+func (t *Tree) dirMarker(id uint32) (ClassByte, bool) {
+	cb, ok := t.dirMarkers[id]
+	return cb, ok
+}
+
+// setDirMarker installs (or replaces) the dir-marker file at id.
+func (t *Tree) setDirMarker(id uint32, cb ClassByte) {
+	if t.dirMarkers == nil {
+		t.dirMarkers = make(map[uint32]ClassByte)
+	}
+	t.dirMarkers[id] = cb
+}
+
+// clearDirMarker removes the dir-marker file at id, if present.
+func (t *Tree) clearDirMarker(id uint32) {
+	delete(t.dirMarkers, id)
 }
 
 // nodeChunkSize / chunkBits define the chunked arena geometry. Each chunk
@@ -293,7 +319,7 @@ func (t *Tree) aggOfChild(cid uint32) Aggregate {
 	if isLeafID(cid) {
 		return t.atLeaf(cid & idMask).effectiveAgg()
 	}
-	return t.atInternal(cid).effectiveAgg()
+	return t.internalAgg(cid)
 }
 
 // AddBatch ingests a contiguous range of objects. See [Batch] for the
@@ -387,7 +413,7 @@ func (t *Tree) ListDirectory(prefix string) ([]Entry, error) {
 	for {
 		n := t.atInternal(id)
 		if rem == "" {
-			return t.listAtInternal(n), nil
+			return t.listAtInternal(id), nil
 		}
 		idx, ok := t.findChild(n.children, rem[0])
 		if !ok {
@@ -418,18 +444,19 @@ func (t *Tree) ListDirectory(prefix string) ([]Entry, error) {
 	}
 }
 
-// listAtInternal lists entries reachable from internal n without crossing '/'.
-// When the requested prefix lands exactly on a node boundary, n.file (if any)
-// is the directory-marker object at that prefix and is emitted with an empty
-// name so callers may distinguish or filter it.
-func (t *Tree) listAtInternal(n *internal) []Entry {
+// listAtInternal lists entries reachable from the internal at id without
+// crossing '/'. When the requested prefix lands exactly on the node
+// boundary, the dir-marker (if any) is emitted with an empty name so
+// callers may distinguish or filter it.
+func (t *Tree) listAtInternal(id uint32) []Entry {
+	n := t.atInternal(id)
 	out := make([]Entry, 0, len(n.children)+1)
-	if n.file != nil {
+	if cb, ok := t.dirMarker(id); ok {
 		out = append(out, Entry{
 			Name:  "",
 			IsDir: false,
-			Class: n.file.Class,
-			Size:  n.file.Size,
+			Class: cb.Class,
+			Size:  cb.Size,
 		})
 	}
 	for _, cid := range n.children {
@@ -463,12 +490,12 @@ func (t *Tree) listInsideEdge(cid uint32, consumed string) []Entry {
 	}
 	n := t.atInternal(cid)
 	out := make([]Entry, 0, len(n.children)+1)
-	if n.file != nil {
+	if cb, ok := t.dirMarker(cid); ok {
 		out = append(out, Entry{
 			Name:  residual,
 			IsDir: false,
-			Class: n.file.Class,
-			Size:  n.file.Size,
+			Class: cb.Class,
+			Size:  cb.Size,
 		})
 	}
 	for _, c := range n.children {
@@ -501,12 +528,12 @@ func (t *Tree) emitFromChild(cid uint32, acc string, out []Entry) []Entry {
 		})
 	}
 	n := t.atInternal(cid)
-	if n.file != nil {
+	if cb, ok := t.dirMarker(cid); ok {
 		out = append(out, Entry{
 			Name:  fullName,
 			IsDir: false,
-			Class: n.file.Class,
-			Size:  n.file.Size,
+			Class: cb.Class,
+			Size:  cb.Size,
 		})
 	}
 	for _, c := range n.children {
@@ -611,7 +638,7 @@ func (t *Tree) insertFromPath(path []framePath, obj Object) []framePath {
 		if key == "" {
 			// key terminates exactly at internal n: it becomes (or remains)
 			// a directory-marker node. n.agg was already bumped above.
-			n.file = &ClassByte{Class: obj.Class, Size: obj.Size}
+			t.setDirMarker(id, ClassByte{Class: obj.Class, Size: obj.Size})
 			return path
 		}
 
@@ -667,7 +694,7 @@ func (t *Tree) insertFromPath(path []framePath, obj Object) []framePath {
 
 		if lcp == len(key) {
 			inter := t.atInternal(intID)
-			inter.file = &ClassByte{Class: obj.Class, Size: obj.Size}
+			t.setDirMarker(intID, ClassByte{Class: obj.Class, Size: obj.Size})
 			inter.children = []uint32{childCID}
 			t.atInternal(id).children[idx] = intID
 			return append(path, framePath{id: intID, consumed: consumed + lcp})
@@ -725,9 +752,9 @@ func (t *Tree) insertAgainstLeafChild(path []framePath, parentID uint32, childSl
 		intID := t.allocInternal(internal{
 			edgeOff: oldOff,
 			edgeLen: oldLen,
-			file:    &ClassByte{Class: oldClass, Size: oldSize},
 			agg:     &ag,
 		})
+		t.setDirMarker(intID, ClassByte{Class: oldClass, Size: oldSize})
 		t.releaseLeaf(leafID)
 
 		nOff, nLen := t.allocEdge(key[lcp:])
@@ -762,7 +789,7 @@ func (t *Tree) insertAgainstLeafChild(path []framePath, parentID uint32, childSl
 		lf.edgeOff += uint32(lcp)
 		lf.edgeLen -= uint32(lcp)
 		inter := t.atInternal(intID)
-		inter.file = &ClassByte{Class: obj.Class, Size: obj.Size}
+		t.setDirMarker(intID, ClassByte{Class: obj.Class, Size: obj.Size})
 		inter.children = []uint32{childCID}
 		t.atInternal(parentID).children[childSlot] = intID
 		return append(path, framePath{id: intID, consumed: consumed + lcp})
@@ -787,7 +814,7 @@ func (t *Tree) insertAgainstLeafChild(path []framePath, parentID uint32, childSl
 func (t *Tree) bumpAgg(id uint32, obj Object) {
 	n := t.atInternal(id)
 	if n.agg == nil {
-		a := n.effectiveAgg()
+		a := t.internalAgg(id)
 		n.agg = &a
 	}
 	n.agg.Objects++
@@ -809,7 +836,7 @@ func (t *Tree) aggForSplitInternalChild(childID uint32, obj Object) *Aggregate {
 			a.Bytes = append(make(ClassBytes, 0, k+1), child.agg.Bytes...)
 		}
 	} else {
-		a = child.effectiveAgg()
+		a = t.internalAgg(childID)
 		a.Objects++
 	}
 	a.Bytes.Add(obj.Class, obj.Size)
@@ -878,13 +905,12 @@ func (t *Tree) deleteKey(key string) {
 
 	// rem == "" terminated at an internal node — the file we want is the
 	// dir-marker at curID (if any).
-	cur := t.atInternal(curID)
-	if cur.file == nil {
+	cb, ok := t.dirMarker(curID)
+	if !ok {
 		return
 	}
-	class, size := cur.file.Class, cur.file.Size
-	t.applyDelta(path, class, -size, -1)
-	cur.file = nil
+	t.applyDelta(path, cb.Class, -cb.Size, -1)
+	t.clearDirMarker(curID)
 	t.compressAfterDelete(pops)
 }
 
@@ -901,11 +927,12 @@ func (t *Tree) compressAfterDelete(pops []deletePop) {
 			return
 		}
 		child := t.atInternal(childCID)
+		_, hasMarker := t.dirMarker(childCID)
 		switch {
-		case child.file == nil && len(child.children) == 0:
+		case !hasMarker && len(child.children) == 0:
 			parent.children = append(parent.children[:fr.childIdx], parent.children[fr.childIdx+1:]...)
 			t.releaseInternal(childCID)
-		case child.file == nil && len(child.children) == 1:
+		case !hasMarker && len(child.children) == 1:
 			onlyCID := child.children[0]
 			merged := t.edgeStr(child.edgeOff, child.edgeLen) + t.edgeOf(onlyCID)
 			mOff, mLen := t.allocEdge(merged)
@@ -968,20 +995,20 @@ func (t *Tree) updateKey(obj Object) {
 		curID = childCID
 		path = append(path, framePath{id: curID, consumed: consumed})
 	}
-	cur := t.atInternal(curID)
-	if cur.file == nil {
+	cb, ok := t.dirMarker(curID)
+	if !ok {
 		return
 	}
-	oldClass, oldSize := cur.file.Class, cur.file.Size
+	oldClass, oldSize := cb.Class, cb.Size
 	if oldClass == obj.Class {
 		if d := obj.Size - oldSize; d != 0 {
 			t.applyDelta(path, obj.Class, d, 0)
 		}
-		cur.file.Size = obj.Size
+		t.setDirMarker(curID, ClassByte{Class: obj.Class, Size: obj.Size})
 		return
 	}
 	t.applyDelta(path, oldClass, -oldSize, -1)
-	cur.file = &ClassByte{Class: obj.Class, Size: obj.Size}
+	t.setDirMarker(curID, ClassByte{Class: obj.Class, Size: obj.Size})
 	t.applyDelta(path, obj.Class, obj.Size, +1)
 }
 
@@ -1008,7 +1035,7 @@ func (t *Tree) applyDelta(path []framePath, class StorageClass, sizeDelta, objDe
 	for i := range path {
 		n := t.atInternal(path[i].id)
 		if n.agg == nil {
-			a := n.effectiveAgg()
+			a := t.internalAgg(path[i].id)
 			n.agg = &a
 		}
 		n.agg.Objects += objDelta
@@ -1066,8 +1093,8 @@ func (rc *rangeCursor) Next() (Object, bool) {
 		n := rc.t.atInternal(top.id)
 		if !top.fileEmitted {
 			top.fileEmitted = true
-			if n.file != nil && top.prefix > rc.lo && top.prefix <= rc.hi {
-				return Object{Key: top.prefix, Size: n.file.Size, Class: n.file.Class}, true
+			if cb, ok := rc.t.dirMarker(top.id); ok && top.prefix > rc.lo && top.prefix <= rc.hi {
+				return Object{Key: top.prefix, Size: cb.Size, Class: cb.Class}, true
 			}
 		}
 		if top.nextChild >= len(n.children) {
@@ -1159,7 +1186,7 @@ func (t *Tree) Stats() TreeStats {
 		s.AliveNodes++
 		s.AliveInternals++
 
-		hasFile := n.file != nil
+		_, hasFile := t.dirMarker(id)
 		nc := len(n.children)
 		switch {
 		case hasFile && nc > 0:

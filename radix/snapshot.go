@@ -133,7 +133,7 @@ func (t *Tree) Save(w io.Writer) error {
 			fi++
 			continue
 		}
-		if err := t.writeInternalRecord(bw, intDiskID[id], t.atInternal(id), mapChild); err != nil {
+		if err := t.writeInternalRecord(bw, intDiskID[id], id, t.atInternal(id), mapChild); err != nil {
 			return fmt.Errorf("radix: write internal %d: %w", id, err)
 		}
 	}
@@ -215,9 +215,11 @@ func Load(r io.Reader) (*Tree, error) {
 		n := t.atInternal(memID)
 		n.edgeOff = off
 		n.edgeLen = length
-		n.file = rec.file
 		n.agg = rec.agg
 		n.children = rec.children // disk IDs; rewritten below
+		if rec.file != nil {
+			t.setDirMarker(memID, *rec.file)
+		}
 		diskToCID[rec.id] = memID
 	}
 
@@ -296,8 +298,8 @@ func (t *Tree) Export(yield func(Object) bool) {
 func (t *Tree) exportFromInternal(id uint32, prefix string, yield func(Object) bool) bool {
 	n := t.atInternal(id)
 	fullKey := prefix + t.edgeStr(n.edgeOff, n.edgeLen)
-	if n.file != nil {
-		if !yield(Object{Key: fullKey, Size: n.file.Size, Class: n.file.Class}) {
+	if cb, ok := t.dirMarker(id); ok {
+		if !yield(Object{Key: fullKey, Size: cb.Size, Class: cb.Class}) {
 			return false
 		}
 	}
@@ -349,16 +351,19 @@ func readHeader(r io.Reader) (maxID, aliveCount uint32, err error) {
 
 // writeInternalRecord serialises an internal node as a v1-format record,
 // rewriting child references through mapChild so they refer to disk IDs.
-func (t *Tree) writeInternalRecord(w *bufio.Writer, id uint32, n *internal, mapChild func(uint32) uint32) error {
+// arenaID is the in-memory arena slot — used to look up any dir-marker
+// pinned at this internal.
+func (t *Tree) writeInternalRecord(w *bufio.Writer, diskID uint32, arenaID uint32, n *internal, mapChild func(uint32) uint32) error {
+	marker, hasMarker := t.dirMarker(arenaID)
 	var flags uint8
-	if n.file != nil {
+	if hasMarker {
 		flags |= snapFlagHasFile
 	}
 	if n.agg != nil {
 		flags |= snapFlagHasAgg
 	}
 	var hdr [9]byte
-	binary.LittleEndian.PutUint32(hdr[0:4], id)
+	binary.LittleEndian.PutUint32(hdr[0:4], diskID)
 	hdr[4] = flags
 	binary.LittleEndian.PutUint16(hdr[5:7], uint16(n.edgeLen))
 	binary.LittleEndian.PutUint16(hdr[7:9], uint16(len(n.children)))
@@ -381,10 +386,10 @@ func (t *Tree) writeInternalRecord(w *bufio.Writer, id uint32, n *internal, mapC
 			}
 		}
 	}
-	if n.file != nil {
+	if hasMarker {
 		var fb [9]byte
-		fb[0] = uint8(n.file.Class)
-		binary.LittleEndian.PutUint64(fb[1:9], uint64(n.file.Size))
+		fb[0] = uint8(marker.Class)
+		binary.LittleEndian.PutUint64(fb[1:9], uint64(marker.Size))
 		if _, err := w.Write(fb[:]); err != nil {
 			return err
 		}
