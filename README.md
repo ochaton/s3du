@@ -4,7 +4,7 @@
 keeps everything in a compressed radix-tree snapshot you can re-open
 without re-paying the list cost.
 
-![s3du TUI](screenshot.png)
+![s3du TUI](demo.gif)
 
 ## Install
 
@@ -76,3 +76,20 @@ only. Bar is normalised to the listing total (entries sum to 100%).
 Structured slog logs are off by default — pass `-log <path>` to enable
 file logging. SDK retry events (SlowDown, adaptive throttling) surface
 through the file logger so you can diagnose a scan that goes quiet.
+
+## Regenerating demo.gif
+
+The README animation comes from a fully synthetic snapshot — no real
+bucket data. To re-record:
+
+```bash
+brew install vhs ffmpeg ttyd   # one-time
+go install .                   # current s3du on $PATH
+go run ./internal/cmd/gen-demo # writes /tmp/s3du-demo.snap
+vhs demo.tape                  # writes demo.gif
+```
+
+The synthetic dataset has ~7 000 objects across `datasets/`, `logs/`,
+`archive/`, `reports/`, and `misc/` prefixes, mixing STANDARD,
+STANDARD_IA, INTELLIGENT_TIERING, GLACIER, DEEP_ARCHIVE, and ONEZONE_IA
+storage classes. Total ~370 GiB.
