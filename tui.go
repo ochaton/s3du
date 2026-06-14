@@ -25,6 +25,17 @@ const (
 	sortBySize    sortMode = iota // default — descending
 	sortByName                    // ascending by name
 	sortByObjects                 // descending by recursive object count
+	sortByCost                    // descending by monthly storage cost
+)
+
+// barMode picks how the per-row size indicator is rendered.
+type barMode uint8
+
+const (
+	barOff      barMode = iota // no widget at all
+	barOnly                    // default: filled █ blocks only
+	barAndPct                  // bar AND " 12.3%" alongside
+	barPctOnly                 // just " 12.3%", no bar
 )
 
 // tuiModel drives the radix-tree browser. It holds no derived state across
@@ -44,7 +55,8 @@ type tuiModel struct {
 	sortMode   sortMode      // current sort column
 	sortAsc    bool          // false = descending (default for size/objects), true = ascending
 	dirsFirst  bool          // when true, all directories sort ahead of files regardless of column
-	showHelp   bool          // when true, View renders the help modal instead of the listing
+	showHelp   bool          // when true, View overlays the help modal on top of the listing
+	barMode    barMode       // visualisation mode for the per-row size indicator
 }
 
 // navFrame remembers the cursor position at each ancestor so going back
@@ -61,6 +73,7 @@ func initialModel(tree *radix.Tree, region string) *tuiModel {
 		sortMode:  sortBySize,
 		sortAsc:   false, // size descending
 		dirsFirst: true,
+		barMode:   barOnly,
 	}
 	m.reload()
 	return m
@@ -140,6 +153,21 @@ func (m *tuiModel) sortEntries() {
 				return 1
 			}
 			return -1
+		case sortByCost:
+			ac, bc := entryCost(a, m.region), entryCost(b, m.region)
+			if ac == bc {
+				return 0
+			}
+			if ac < bc {
+				if asc {
+					return -1
+				}
+				return 1
+			}
+			if asc {
+				return 1
+			}
+			return -1
 		default: // sortBySize
 			ab, bb := entryBytes(a), entryBytes(b)
 			if ab == bb {
@@ -172,6 +200,13 @@ func entryObjects(e radix.Entry) int64 {
 		return e.Aggregate.Objects
 	}
 	return 1
+}
+
+func entryCost(e radix.Entry, region string) float64 {
+	if e.IsDir {
+		return dirCost(e.Aggregate.Bytes, region)
+	}
+	return monthlyStorageCost(e.Size, e.Class.String(), region)
 }
 
 func (m *tuiModel) Init() tea.Cmd { return nil }
@@ -208,7 +243,7 @@ func (m *tuiModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			if m.cursor < len(m.entries)-1 {
 				m.cursor++
 			}
-		case "home", "g":
+		case "home":
 			m.cursor = 0
 		case "end", "G":
 			m.cursor = max(0, len(m.entries)-1)
@@ -229,9 +264,13 @@ func (m *tuiModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.cycleSort(sortByName, true)
 		case "C":
 			m.cycleSort(sortByObjects, false)
+		case "$":
+			m.cycleSort(sortByCost, false)
 		case "t":
 			m.dirsFirst = !m.dirsFirst
 			m.sortEntries()
+		case "g":
+			m.barMode = (m.barMode + 1) % 4
 		}
 	}
 	return m, nil
@@ -295,7 +334,7 @@ var (
 	barFillStyle   = lipgloss.NewStyle().Bold(true)
 	barEmptyStyle  = lipgloss.NewStyle().Faint(true)
 	helpBoxStyle   = lipgloss.NewStyle().Border(lipgloss.RoundedBorder()).Padding(1, 2)
-	footerHelpHint = "↑/↓ move · Enter descend · Backspace up · s size · n name · C count · t dirs · ? help · q quit"
+	footerHelpHint = "↑/↓ move · Enter descend · Backspace up · s size · n name · C count · $ cost · t dirs · g bar · ? help · q quit"
 )
 
 // percentBarWidth is the fixed character width of the per-row size bar.
@@ -303,10 +342,19 @@ var (
 // glance, narrow enough not to crowd long key names.
 const percentBarWidth = 12
 
+// pctWidth is the character width of the formatted percentage value
+// (e.g. " 12.3%" — sign + 4 digits + percent sign).
+const pctWidth = 6
+
 func (m *tuiModel) View() string {
+	listing := m.listingView()
 	if m.showHelp {
-		return m.helpView()
+		return overlayCentered(listing, m.helpView(), m.width, m.height)
 	}
+	return listing
+}
+
+func (m *tuiModel) listingView() string {
 	var b strings.Builder
 	prefix := m.prefix
 	if prefix == "" {
@@ -329,27 +377,29 @@ func (m *tuiModel) View() string {
 		return b.String()
 	}
 
-	// Layout: bytes + bar + name + class + objects + $/mo. Name takes the
-	// remaining width. The bar widget is fixed at percentBarWidth.
-	const fixedCols = 10 + 2 + percentBarWidth + 2 + 19 + 2 + 10 + 2 + 10 + 2 // bytes, bar, class, objects, $/mo
-	nameWidth := max(m.width-fixedCols, 20)
+	// Column widths. The visual widget can be 0 chars (off mode), so don't
+	// include the gap after it when there's nothing to gap from.
+	visW := m.visualWidth()
+	visualGap := "  "
+	if visW == 0 {
+		visualGap = ""
+	}
+	const fixedNonVisual = 10 + 2 + 2 + 19 + 2 + 10 + 2 + 10 // bytes,name-gap,class,objects,cost gaps
+	nameWidth := max(m.width-fixedNonVisual-visW-len(visualGap), 16)
 
-	header := fmt.Sprintf("%10s  %-*s  %-*s  %-19s  %10s  %10s",
-		"bytes", percentBarWidth, "% size", nameWidth, "name", "class", "objects", "$/mo")
+	header := fmt.Sprintf("%10s  %-*s%s%-*s  %-19s  %10s  %10s",
+		"bytes",
+		visW, m.visualHeader(),
+		visualGap,
+		nameWidth, "name",
+		"class", "objects", "$/mo")
 	b.WriteString(dimStyle.Render(header))
 	b.WriteString("\n")
 
 	startRow, endRow := visibleRange(m.cursor, m.height-6, len(m.entries))
 	for i := startRow; i < endRow; i++ {
 		e := m.entries[i]
-		line := m.renderRow(e, nameWidth)
-		switch {
-		case i == m.cursor:
-			line = selectedStyle.Render(line)
-		case e.IsDir:
-			line = dirStyle.Render(line)
-		}
-		b.WriteString(line)
+		b.WriteString(m.renderRow(e, nameWidth, i == m.cursor))
 		b.WriteString("\n")
 	}
 
@@ -366,6 +416,51 @@ func (m *tuiModel) View() string {
 	return b.String()
 }
 
+// visualHeader returns the header-row label for the size-widget column.
+func (m *tuiModel) visualHeader() string {
+	switch m.barMode {
+	case barOff:
+		return ""
+	case barOnly:
+		return "% size"
+	case barAndPct:
+		return "% size       "
+	case barPctOnly:
+		return "  %"
+	}
+	return ""
+}
+
+// overlayCentered places overlay on top of base in the given terminal
+// rectangle. The overlay's lines REPLACE base lines in the centered band
+// — bubbletea is line-based, so genuine alpha-overlay isn't available
+// without ANSI-aware splicing; this approach matches what ncdu's help
+// modal does (the listing is hidden behind the box).
+func overlayCentered(base, overlay string, width, height int) string {
+	baseLines := strings.Split(base, "\n")
+	overlayLines := strings.Split(overlay, "\n")
+	overlayH := len(overlayLines)
+	overlayW := 0
+	for _, l := range overlayLines {
+		if w := lipgloss.Width(l); w > overlayW {
+			overlayW = w
+		}
+	}
+	vStart := max((height-overlayH)/2, 0)
+	hStart := max((width-overlayW)/2, 0)
+	pad := strings.Repeat(" ", hStart)
+	out := make([]string, len(baseLines))
+	copy(out, baseLines)
+	for i, line := range overlayLines {
+		idx := vStart + i
+		for len(out) <= idx {
+			out = append(out, "")
+		}
+		out[idx] = pad + line
+	}
+	return strings.Join(out, "\n")
+}
+
 // sortIndicator returns a short tag like "[size↓ dirs first]" that the
 // header strip renders so the user can tell what they're looking at.
 func (m *tuiModel) sortIndicator() string {
@@ -375,6 +470,8 @@ func (m *tuiModel) sortIndicator() string {
 		col = "name"
 	case sortByObjects:
 		col = "count"
+	case sortByCost:
+		col = "cost"
 	}
 	arrow := "↓"
 	if m.sortAsc {
@@ -387,11 +484,11 @@ func (m *tuiModel) sortIndicator() string {
 	return fmt.Sprintf("[%s%s%s]", col, arrow, flags)
 }
 
-// renderRow renders one entry with size, percent bar, name, class, objects,
-// and cost. The bar is sized to entryBytes(e) / m.maxBytes (which is the
-// largest single-entry size in the current listing, NOT the directory
-// total — matches how ncdu visualises a single directory).
-func (m *tuiModel) renderRow(e radix.Entry, nameWidth int) string {
+// renderRow renders one entry as bytes / visual-bar / name / class /
+// objects / cost. The cursor highlight is applied to the NAME column only
+// (ncdu-style focus indicator), not the whole line, so metrics stay
+// readable on the highlighted row.
+func (m *tuiModel) renderRow(e radix.Entry, nameWidth int, selected bool) string {
 	name := e.Name
 	if !e.IsDir && name == "" {
 		name = "."
@@ -399,30 +496,72 @@ func (m *tuiModel) renderRow(e radix.Entry, nameWidth int) string {
 	if len(name) > nameWidth {
 		name = name[:nameWidth-1] + "…"
 	}
+	// Pad name to its fixed column width first; only THEN apply the style
+	// so the highlight (or bold-dir) spans the full column.
+	namePadded := fmt.Sprintf("%-*s", nameWidth, name)
+	switch {
+	case selected:
+		namePadded = selectedStyle.Render(namePadded)
+	case e.IsDir:
+		namePadded = dirStyle.Render(namePadded)
+	}
 
 	bytes := entryBytes(e)
-	bar := renderBar(bytes, m.maxBytes, percentBarWidth)
+	visual := m.renderVisual(bytes)
 
 	if e.IsDir {
 		cost := dirCost(e.Aggregate.Bytes, m.region)
-		return fmt.Sprintf("%10s  %s  %-*s  %-19s  %10d  %10s",
+		return fmt.Sprintf("%10s  %s  %s  %-19s  %10d  %10s",
 			humanBytes(bytes),
-			bar,
-			nameWidth, name,
+			visual,
+			namePadded,
 			dominantClassLabel(e.Aggregate.Bytes),
 			e.Aggregate.Objects,
 			humanDollars(cost),
 		)
 	}
 	cost := monthlyStorageCost(e.Size, e.Class.String(), m.region)
-	return fmt.Sprintf("%10s  %s  %-*s  %-19s  %10s  %10s",
+	return fmt.Sprintf("%10s  %s  %s  %-19s  %10s  %10s",
 		humanBytes(bytes),
-		bar,
-		nameWidth, name,
+		visual,
+		namePadded,
 		e.Class.String(),
 		"",
 		humanDollars(cost),
 	)
+}
+
+// visualWidth returns the rendered width of the bar/percent widget for
+// the current barMode. Used by the header to align columns and by the
+// listing block to compute remaining name-column width.
+func (m *tuiModel) visualWidth() int {
+	switch m.barMode {
+	case barOff:
+		return 0
+	case barOnly:
+		return percentBarWidth
+	case barAndPct:
+		return percentBarWidth + 1 + pctWidth
+	case barPctOnly:
+		return pctWidth
+	}
+	return 0
+}
+
+// renderVisual draws the per-row size widget according to the current
+// barMode. value/m.maxBytes gives the proportion.
+func (m *tuiModel) renderVisual(value int64) string {
+	switch m.barMode {
+	case barOff:
+		return ""
+	case barOnly:
+		return renderBar(value, m.maxBytes, percentBarWidth)
+	case barAndPct:
+		return renderBar(value, m.maxBytes, percentBarWidth) + " " + renderPct(value, m.maxBytes)
+	case barPctOnly:
+		return renderPct(value, m.maxBytes)
+	}
+	return ""
 }
 
 // renderBar draws a `width`-character solid-block bar proportional to
@@ -442,6 +581,15 @@ func renderBar(value, max int64, width int) string {
 		barEmptyStyle.Render(strings.Repeat("·", width-filled))
 }
 
+// renderPct formats value/max as a fixed-width percentage like "  4.5%".
+func renderPct(value, max int64) string {
+	if max <= 0 {
+		return fmt.Sprintf("%*s", pctWidth, "")
+	}
+	pct := float64(value) * 100 / float64(max)
+	return fmt.Sprintf("%5.1f%%", pct)
+}
+
 // helpView renders the modal help screen as a centered rounded-border box.
 // Listed bindings mirror the ncdu cheat sheet adapted to s3du's vocabulary.
 func (m *tuiModel) helpView() string {
@@ -451,7 +599,7 @@ func (m *tuiModel) helpView() string {
 		"Navigation",
 		"  ↑/k        previous entry",
 		"  ↓/j        next entry",
-		"  g / Home   first entry",
+		"  Home       first entry",
 		"  G / End    last entry",
 		"  PgUp/PgDn  page up / page down",
 		"  Enter / l  descend into selected dir",
@@ -461,7 +609,11 @@ func (m *tuiModel) helpView() string {
 		"  s          by size (toggle direction)",
 		"  n          by name (toggle direction)",
 		"  C          by object count (toggle direction)",
+		"  $          by monthly cost (toggle direction)",
 		"  t          toggle directories-before-files",
+		"",
+		"Display",
+		"  g          cycle bar: off → bar → bar+% → % only",
 		"",
 		"Misc",
 		"  ?          show / hide this help",
