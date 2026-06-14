@@ -174,6 +174,7 @@ type ProgressSnapshot struct {
 	InflightEWMA      float64
 	ObjectsPerSec     float64
 	RequestsPerSec    float64
+	ObjectsPerList    float64 // EWMA-based "keys returned per ListObjectsV2 call"
 	TotalRequestNanos int64
 	QueueDepth        int // current length of the scanner's work queue
 	BytesByClass      [numStorageClasses]int64
@@ -194,6 +195,12 @@ func (p *Progress) Snapshot() ProgressSnapshot {
 		ObjectsPerSec:     math.Float64frombits(p.objectsPerSecBits.Load()),
 		RequestsPerSec:    math.Float64frombits(p.requestsPerSecBits.Load()),
 		TotalRequestNanos: p.totalRequestNanos.Load(),
+	}
+	// EWMA-based ratio: stays responsive to "now" without storing a
+	// separate ratio EWMA. Guard against the cold-start case where no
+	// requests have completed yet.
+	if s.RequestsPerSec > 0 {
+		s.ObjectsPerList = s.ObjectsPerSec / s.RequestsPerSec
 	}
 	if fnp := p.queueDepthFn.Load(); fnp != nil {
 		s.QueueDepth = (*fnp)()

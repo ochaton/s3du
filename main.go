@@ -61,7 +61,7 @@ func main() {
 	flag.BoolVar(&o.loadOnly, "load", false, "skip scanning, load the snapshot from -snapshot and continue (e.g., launch TUI)")
 	flag.BoolVar(&o.interactive, "i", false, "launch the bubbletea TUI after the scan finishes")
 	flag.BoolVar(&o.debug, "debug", false, "mirror the structured log to stderr (disables the live progress dashboard); file logging happens regardless")
-	flag.StringVar(&o.logPath, "log", "", "structured-log file path (default: <cache>/s3du/<bucket>/scan.log)")
+	flag.StringVar(&o.logPath, "log", "", "structured-log file path; file logging is disabled when empty")
 	flag.BoolVar(&o.stats, "stats", false, "after acquiring the tree, print arena/memory statistics and exit (skips TUI and listing)")
 	flag.BoolVar(&o.debugTree, "debug-tree", false, "launch the radix-internals TUI (raw nodes, edges, CIDs) instead of the directory browser; implies -i")
 	flag.Parse()
@@ -139,6 +139,25 @@ func acquireTree(ctx context.Context, o *opts) (*radix.Tree, error) {
 	}
 	if o.region == "" {
 		o.region = client.Options().Region
+	}
+	// Auto-discover the bucket's actual region via HeadBucket. Saves a
+	// PermanentRedirect cascade when the SDK's default region differs from
+	// where the bucket lives, and ensures cost calculations use the right
+	// regional price table. Skipped for custom endpoints — those are not
+	// AWS S3 and HeadBucket's region-discovery semantics don't apply.
+	if o.endpoint == "" {
+		if discovered, err := discoverBucketRegion(ctx, client, o.bucket); err != nil {
+			slog.Warn("HeadBucket region discovery failed; using configured region",
+				"err", err, "region", o.region)
+		} else if discovered != "" && discovered != o.region {
+			slog.Info("HeadBucket discovered bucket region",
+				"bucket", o.bucket, "from", o.region, "to", discovered)
+			o.region = discovered
+			client, err = newS3Client(ctx, o.region, o.endpoint)
+			if err != nil {
+				return nil, fmt.Errorf("re-init S3 client in %s: %w", o.region, err)
+			}
+		}
 	}
 
 	tree := radix.New()
@@ -227,15 +246,11 @@ func printRootListing(tree *radix.Tree, region string) error {
 // configureLogging installs slog's default logger and returns the (possibly
 // nil) opened log file so main can close it on exit.
 //
-// File logging is on by default at Debug level; the file lives at the path
-// supplied via -log or, when empty, at <cache>/s3du/<bucket>/scan.log so
-// the dashboard's progress display stays uncluttered while a complete
-// audit trail is captured on disk.
-//
-// When -debug is also set, the logger writes to BOTH the file AND stderr,
-// matching the legacy behaviour of mixing structured logs with the run.
-// When the bucket is empty (e.g. `-load`-only mode without a scan), file
-// logging is skipped — there's nothing useful to record.
+// File logging is opt-in via -log <path>. Without the flag and without
+// -debug, slog writes to io.Discard so the dashboard's stderr stays
+// uncluttered and no disk is consumed. With -debug, slog writes to stderr
+// at Debug level (and TUI is disabled in that mode). When both -log and
+// -debug are set, slog writes to both file and stderr.
 func configureLogging(debug bool, logPath, bucket, region string) (*os.File, error) {
 	level := slog.LevelDebug
 
@@ -253,14 +268,17 @@ func configureLogging(debug bool, logPath, bucket, region string) (*os.File, err
 		file = f
 		writers = append(writers, f)
 	}
-	if debug || len(writers) == 0 {
+	if debug {
 		writers = append(writers, os.Stderr)
 	}
 
 	var out io.Writer
-	if len(writers) == 1 {
+	switch len(writers) {
+	case 0:
+		out = io.Discard
+	case 1:
 		out = writers[0]
-	} else {
+	default:
 		out = io.MultiWriter(writers...)
 	}
 
@@ -272,23 +290,10 @@ func configureLogging(debug bool, logPath, bucket, region string) (*os.File, err
 }
 
 // resolveLogPath returns the file the structured log should be written to,
-// or "" to skip file logging. Precedence: explicit -log flag → derived from
-// bucket/region → nothing.
+// or "" to skip file logging. Only honours the explicit -log flag — file
+// logging is off by default to avoid spamming disk on every run.
 func resolveLogPath(explicit, bucket, region string) string {
-	if explicit != "" {
-		return explicit
-	}
-	if bucket == "" {
-		return ""
-	}
-	dir, err := os.UserCacheDir()
-	if err != nil {
-		return ""
-	}
-	if region == "" {
-		region = "unknown"
-	}
-	return filepath.Join(dir, "s3du", bucket+"@"+region, "scan.log")
+	return explicit
 }
 
 // defaultSnapshotPath returns ~/.cache/s3du/<bucket>@<region>/tree.snap.
@@ -332,6 +337,27 @@ func newS3Client(ctx context.Context, region, endpoint string) (*s3.Client, erro
 			opt.UsePathStyle = true
 		}
 	}), nil
+}
+
+// discoverBucketRegion calls HeadBucket and returns the value the server
+// reports for x-amz-bucket-region. SDK v2 propagates that header into
+// BucketRegion on the response even when the bucket lives in a different
+// region than the calling client (the SDK transparently follows the 301
+// redirect on retry, but the header is exposed regardless).
+//
+// Empty string + nil error means the response did not include a region —
+// typically only the case for very old S3 implementations or non-AWS S3
+// services that don't honour the header. The caller falls back to the
+// configured region in that case.
+func discoverBucketRegion(ctx context.Context, client *s3.Client, bucket string) (string, error) {
+	out, err := client.HeadBucket(ctx, &s3.HeadBucketInput{Bucket: aws.String(bucket)})
+	if err != nil {
+		return "", err
+	}
+	if out.BucketRegion == nil {
+		return "", nil
+	}
+	return *out.BucketRegion, nil
 }
 
 // slogAWSLogger adapts the smithy-go logger interface onto slog. Warn-class

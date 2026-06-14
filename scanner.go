@@ -21,12 +21,16 @@ import (
 var slashStr = aws.String("/")
 
 // workQueueSlotsPerWorker is the per-worker share of the shared queue buffer.
-// Total capacity = workers × this constant. With the inline-fallback path
-// (tryEnqueue → process-inline when full) absorbing any overflow, the queue
-// only needs enough slack for normal worker hand-off, not exponential
-// fan-out. Small buffer keeps producers landing on inline recursion sooner,
-// improving cache locality and bounding worst-case in-flight memory.
-const workQueueSlotsPerWorker = 4
+// Total capacity = workers × this constant.
+//
+// One slot per worker is the sweet spot for our access pattern. Producers
+// land on inline recursion as soon as the queue fills, which pushes each
+// worker into a depth-first dive of its own sub-tree. Deeper dives reach
+// the recursive-scan threshold (maxDepth) sooner, where each ListObjectsV2
+// call returns up to 1 000 keys — versus a probe call that may return only
+// a handful. Maximising the keys-per-list ratio is the primary throughput
+// lever once we are past the deadlock and rate-limit edge cases.
+const workQueueSlotsPerWorker = 1
 
 // Scanner walks an S3 bucket and ingests every object into a radix.Tree.
 //
