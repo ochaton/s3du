@@ -2,7 +2,6 @@ package main
 
 import (
 	"fmt"
-	"io"
 	"math"
 	"sync/atomic"
 	"time"
@@ -199,45 +198,6 @@ func (s ProgressSnapshot) CumulativeParallelism() float64 {
 		return 0
 	}
 	return float64(s.TotalRequestNanos) / float64(s.Elapsed)
-}
-
-// RunReporter prints a one-line progress summary to w every interval until
-// done is signalled (closed channel). On every tick it also samples the
-// in-flight count into the EWMA so the displayed value reacts to current
-// load on a ~tau timescale rather than being dragged by the lifetime
-// cumulative average.
-func RunReporter(w io.Writer, p *Progress, done <-chan struct{}, interval time.Duration) {
-	tick := time.NewTicker(interval)
-	defer tick.Stop()
-	for {
-		select {
-		case <-done:
-			p.sampleInflight()
-			printProgress(w, p.Snapshot(), true)
-			return
-		case <-tick.C:
-			p.sampleInflight()
-			printProgress(w, p.Snapshot(), false)
-		}
-	}
-}
-
-func printProgress(w io.Writer, s ProgressSnapshot, final bool) {
-	end := "\r"
-	if final {
-		end = "\n"
-	}
-	fmt.Fprintf(w,
-		"lists=%-7d inflight=%2d/%-2d (%3d%%) eff=%5.1f/%-2d (%3d%%) objects=%-9d bytes=%-9s list$=%-7s storage$/mo=%-7s%s",
-		s.ListRequests,
-		s.Inflight, s.MaxWorkers, percent(float64(s.Inflight), s.MaxWorkers),
-		s.InflightEWMA, s.MaxWorkers, percent(s.InflightEWMA, s.MaxWorkers),
-		s.ObjectsSeen,
-		humanBytes(s.TotalBytes()),
-		humanDollars(s.ListCost()),
-		humanDollars(s.MonthlyStorageCost()),
-		end,
-	)
 }
 
 // percent returns the integer-rounded percentage of x against the cap.

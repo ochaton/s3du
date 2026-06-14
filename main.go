@@ -115,13 +115,13 @@ func acquireTree(ctx context.Context, o *opts) (*radix.Tree, error) {
 	tree := radix.New()
 	prog := NewProgress(o.region, o.workers)
 
-	// Reporter is joined via WaitGroup so its final progress line is fully
-	// flushed before the next stderr write — replaces the previous
-	// time.Sleep-and-hope.
+	// Progress dashboard is joined via WaitGroup so its final frame is
+	// fully torn down before the next stderr write. The EWMA sampler runs
+	// on a fixed cadence inside runProgressUI regardless of UI refresh.
 	done := make(chan struct{})
 	var reporterWG sync.WaitGroup
 	reporterWG.Go(func() {
-		RunReporter(os.Stderr, prog, done, o.progressEvery)
+		runProgressUI(prog, done, 250*time.Millisecond, o.progressEvery)
 	})
 
 	scanner := NewScanner(client, o.bucket, o.workers, o.parallelDepth, tree, prog)
@@ -164,14 +164,20 @@ func printSummary(tree *radix.Tree, region string) error {
 	fmt.Printf("%-40s %12s %15s %12s\n", "name", "objects", "bytes", "$/month")
 	for _, e := range entries {
 		if e.IsDir {
-			cost := 0.0
-			for _, kv := range e.Aggregate.Bytes {
-				cost += monthlyStorageCost(kv.Size, kv.Class.String(), region)
-			}
-			fmt.Printf("%-40s %12d %15s %12s\n", e.Name, e.Aggregate.Objects, humanBytes(byteSum(e.Aggregate.Bytes)), humanDollars(cost))
+			fmt.Printf("%-40s %12d %15s %12s\n",
+				e.Name,
+				e.Aggregate.Objects,
+				humanBytes(byteSum(e.Aggregate.Bytes)),
+				humanDollars(dirCost(e.Aggregate.Bytes, region)),
+			)
 			continue
 		}
-		fmt.Printf("%-40s %12s %15s %12s\n", e.Name, "(file)", humanBytes(e.Size), humanDollars(monthlyStorageCost(e.Size, e.Class.String(), region)))
+		fmt.Printf("%-40s %12s %15s %12s\n",
+			e.Name,
+			"(file)",
+			humanBytes(e.Size),
+			humanDollars(monthlyStorageCost(e.Size, e.Class.String(), region)),
+		)
 	}
 	return nil
 }
