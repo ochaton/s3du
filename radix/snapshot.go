@@ -6,6 +6,8 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"os"
+	"path/filepath"
 	"slices"
 )
 
@@ -134,6 +136,46 @@ func Load(r io.Reader) (*Tree, error) {
 		}
 	}
 	return t, nil
+}
+
+// SaveFile is a convenience wrapper around [Tree.Save] that writes to path
+// atomically: the snapshot is first written to path+".tmp" and renamed
+// into place on success, so an interrupted run never leaves a half-written
+// file at the destination. Parent directories are created with mode 0755.
+func (t *Tree) SaveFile(path string) (err error) {
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		return err
+	}
+	tmp := path + ".tmp"
+	f, err := os.Create(tmp)
+	if err != nil {
+		return err
+	}
+	defer func() {
+		if err != nil {
+			_ = os.Remove(tmp)
+		}
+	}()
+	if err = t.Save(f); err != nil {
+		_ = f.Close()
+		return err
+	}
+	if err = f.Close(); err != nil {
+		return err
+	}
+	return os.Rename(tmp, path)
+}
+
+// LoadFile is a convenience wrapper around [Load] that opens path, parses
+// the snapshot, and returns the resulting tree. The file is closed before
+// returning regardless of success.
+func LoadFile(path string) (*Tree, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+	return Load(f)
 }
 
 // Export walks every alive leaf in lex order, calling yield with each

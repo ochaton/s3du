@@ -238,7 +238,7 @@ func renderRow(e radix.Entry, region string, nameWidth int) string {
 		name = name[:nameWidth-1] + "…"
 	}
 	if e.IsDir {
-		bytes := byteSum(e.Aggregate.Bytes)
+		bytes := e.Aggregate.Bytes.Total()
 		cost := dirCost(e.Aggregate.Bytes, region)
 		return fmt.Sprintf("%-*s  %-19s  %10d  %10s  %10s",
 			nameWidth, name,
@@ -361,7 +361,7 @@ func dirTotals(entries []radix.Entry, region string) (int64, int64, float64) {
 	for _, e := range entries {
 		if e.IsDir {
 			objs += e.Aggregate.Objects
-			bytes += byteSum(e.Aggregate.Bytes)
+			bytes += e.Aggregate.Bytes.Total()
 			cost += dirCost(e.Aggregate.Bytes, region)
 			continue
 		}

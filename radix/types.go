@@ -143,6 +143,17 @@ func (c *ClassBytes) AddAll(src ClassBytes) {
 // buckets, so the return value is the slice itself.
 func (c ClassBytes) NonZero() []ClassByte { return c }
 
+// Total returns the sum of Size across every bucket. It is the byte
+// counterpart to [Aggregate.Objects] for callers that have already drilled
+// down to a ClassBytes value.
+func (c ClassBytes) Total() int64 {
+	var t int64
+	for i := range c {
+		t += c[i].Size
+	}
+	return t
+}
+
 // Aggregate is a recursive summary over a subtree of the radix tree.
 type Aggregate struct {
 	Objects int64

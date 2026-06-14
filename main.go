@@ -84,7 +84,7 @@ func run(o opts) error {
 	if o.interactive {
 		return runTUI(tree, o.region)
 	}
-	return printSummary(tree, o.region)
+	return printRootListing(tree, o.region)
 }
 
 // acquireTree returns the radix.Tree the rest of the program operates on.
@@ -93,7 +93,7 @@ func run(o opts) error {
 // resolved it from the environment so cost calculations match the scan.
 func acquireTree(ctx context.Context, o *opts) (*radix.Tree, error) {
 	if o.loadOnly {
-		tree, err := loadSnapshot(o.snapshotPath)
+		tree, err := radix.LoadFile(o.snapshotPath)
 		if err != nil {
 			return nil, fmt.Errorf("load %s: %w", o.snapshotPath, err)
 		}
@@ -143,16 +143,18 @@ func acquireTree(ctx context.Context, o *opts) (*radix.Tree, error) {
 		int(final.InflightEWMA*100/float64(max(final.MaxWorkers, 1))),
 	)
 
-	if err := saveSnapshot(o.snapshotPath, tree); err != nil {
+	if err := tree.SaveFile(o.snapshotPath); err != nil {
 		return nil, fmt.Errorf("save snapshot %s: %w", o.snapshotPath, err)
 	}
 	fmt.Fprintf(os.Stderr, "snapshot saved to %s\n", o.snapshotPath)
 	return tree, nil
 }
 
-// printSummary prints the top-level directory listing along with totals when
-// the TUI is not requested.
-func printSummary(tree *radix.Tree, region string) error {
+// printRootListing prints the top-level directory listing along with per-
+// directory totals when the TUI is not requested. Distinct from the scan-
+// completion line that acquireTree emits: that one reports timing and
+// effective parallelism, this one reports what was actually scanned.
+func printRootListing(tree *radix.Tree, region string) error {
 	entries, err := tree.ListDirectory("")
 	if err != nil {
 		return err
@@ -167,7 +169,7 @@ func printSummary(tree *radix.Tree, region string) error {
 			fmt.Printf("%-40s %12d %15s %12s\n",
 				e.Name,
 				e.Aggregate.Objects,
-				humanBytes(byteSum(e.Aggregate.Bytes)),
+				humanBytes(e.Aggregate.Bytes.Total()),
 				humanDollars(dirCost(e.Aggregate.Bytes, region)),
 			)
 			continue
@@ -182,14 +184,6 @@ func printSummary(tree *radix.Tree, region string) error {
 	return nil
 }
 
-func byteSum(b radix.ClassBytes) int64 {
-	var t int64
-	for _, kv := range b {
-		t += kv.Size
-	}
-	return t
-}
-
 // defaultSnapshotPath returns ~/.cache/s3du/<bucket>@<region>/tree.snap.
 func defaultSnapshotPath(bucket, region string) (string, error) {
 	dir, err := os.UserCacheDir()
@@ -200,38 +194,6 @@ func defaultSnapshotPath(bucket, region string) (string, error) {
 		region = "unknown"
 	}
 	return filepath.Join(dir, "s3du", bucket+"@"+region, "tree.snap"), nil
-}
-
-// saveSnapshot writes tree to path, creating parent directories.
-func saveSnapshot(path string, tree *radix.Tree) error {
-	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
-		return err
-	}
-	tmp := path + ".tmp"
-	f, err := os.Create(tmp)
-	if err != nil {
-		return err
-	}
-	if err := tree.Save(f); err != nil {
-		_ = f.Close()
-		_ = os.Remove(tmp)
-		return err
-	}
-	if err := f.Close(); err != nil {
-		_ = os.Remove(tmp)
-		return err
-	}
-	return os.Rename(tmp, path)
-}
-
-// loadSnapshot reads a previously saved tree from path.
-func loadSnapshot(path string) (*radix.Tree, error) {
-	f, err := os.Open(path)
-	if err != nil {
-		return nil, err
-	}
-	defer f.Close()
-	return radix.Load(f)
 }
 
 func newS3Client(ctx context.Context, region, endpoint string) (*s3.Client, error) {
