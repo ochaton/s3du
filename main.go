@@ -39,6 +39,7 @@ type opts struct {
 	loadOnly      bool
 	interactive   bool
 	debug         bool
+	stats         bool
 	progressEvery time.Duration
 }
 
@@ -54,6 +55,7 @@ func main() {
 	flag.BoolVar(&o.loadOnly, "load", false, "skip scanning, load the snapshot from -snapshot and continue (e.g., launch TUI)")
 	flag.BoolVar(&o.interactive, "i", false, "launch the bubbletea TUI after the scan finishes")
 	flag.BoolVar(&o.debug, "debug", false, "verbose structured logging to stderr; disables the live progress dashboard")
+	flag.BoolVar(&o.stats, "stats", false, "after acquiring the tree, print arena/memory statistics and exit (skips TUI and listing)")
 	flag.Parse()
 	o.progressEvery = time.Duration(*progressMs) * time.Millisecond
 	configureLogging(o.debug)
@@ -85,6 +87,10 @@ func run(o opts) error {
 		return err
 	}
 
+	if o.stats {
+		printTreeStats(os.Stderr, tree)
+		return nil
+	}
 	if o.interactive {
 		return runTUI(tree, o.region)
 	}

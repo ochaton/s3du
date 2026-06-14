@@ -138,6 +138,71 @@ func loadSnapshotWithProgress(path string, interval time.Duration) (*radix.Tree,
 	return tree, err
 }
 
+// printTreeStats dumps the arena occupancy and per-component heap accounting
+// for the given tree. Used by the -stats flag to drive memory-layout
+// decisions; numbers cover sizes the Go allocator actually charged (small-
+// object size classes), not raw byte counts.
+func printTreeStats(w io.Writer, tree *radix.Tree) {
+	s := tree.Stats()
+	pct := func(part, whole int64) string {
+		if whole == 0 {
+			return " 0.0%"
+		}
+		return fmt.Sprintf("%5.1f%%", float64(part)*100/float64(whole))
+	}
+	avg := func(num, den int64) string {
+		if den == 0 {
+			return "n/a"
+		}
+		return fmt.Sprintf("%.2f", float64(num)/float64(den))
+	}
+	fmt.Fprintf(w, "\n=== radix.Tree stats ===\n")
+	fmt.Fprintf(w, "alive nodes        : %d\n", s.AliveNodes)
+	fmt.Fprintf(w, "  leaves           : %d (%s)   [file != nil, no children]\n", s.Leaves, pct(s.Leaves, s.AliveNodes))
+	fmt.Fprintf(w, "  internals        : %d (%s)   [no file, children > 0]\n", s.Internals, pct(s.Internals, s.AliveNodes))
+	fmt.Fprintf(w, "  internal+file    : %d (%s)   [S3 dir-marker objects]\n", s.InternalsWithFile, pct(s.InternalsWithFile, s.AliveNodes))
+	fmt.Fprintf(w, "  empty            : %d (%s)\n", s.Empty, pct(s.Empty, s.AliveNodes))
+	fmt.Fprintf(w, "nodes with agg     : %d (%s)\n", s.NodesWithAgg, pct(s.NodesWithAgg, s.AliveNodes))
+	fmt.Fprintf(w, "*ClassByte allocs  : %d (%s of alive)\n", s.ClassBytePtrs, pct(s.ClassBytePtrs, s.AliveNodes))
+	fmt.Fprintf(w, "ClassBytes entries : len=%d  cap=%d  avg-per-agg=%s\n", s.ClassBytesLen, s.ClassBytesCap, avg(s.ClassBytesLen, s.NodesWithAgg))
+	fmt.Fprintf(w, "edge bytes (sum)   : %s  max=%d  avg=%s\n", humanBytes(s.EdgeBytes), s.MaxEdgeLen, avg(s.EdgeBytes, s.AliveNodes))
+	fmt.Fprintf(w, "children slots(cap): %d  max=%d  avg=%s\n", s.ChildrenSlots, s.MaxChildrenCount, avg(s.ChildrenSlots, s.AliveNodes))
+
+	fmt.Fprintf(w, "\nedge-length histogram (bytes):\n")
+	edgeLabels := []string{"0", "1", "2", "3-4", "5-8", "9-16", "17-32", "33-64", "65+"}
+	for i, label := range edgeLabels {
+		fmt.Fprintf(w, "  %-6s : %d (%s)\n", label, s.EdgeLenHist[i], pct(s.EdgeLenHist[i], s.AliveNodes))
+	}
+
+	fmt.Fprintf(w, "\nchildren-count histogram:\n")
+	childLabels := []string{"0", "1", "2", "3", "4", "5-7", "8-15", "16-31", "32+"}
+	for i, label := range childLabels {
+		fmt.Fprintf(w, "  %-6s : %d (%s)\n", label, s.ChildrenHist[i], pct(s.ChildrenHist[i], s.AliveNodes))
+	}
+
+	fmt.Fprintf(w, "\nestimated heap (allocator-rounded):\n")
+	fmt.Fprintf(w, "  nodes (arena)    : %s\n", humanBytes(s.EstHeapNodes))
+	fmt.Fprintf(w, "  edges            : %s\n", humanBytes(s.EstHeapEdges))
+	fmt.Fprintf(w, "  children slices  : %s\n", humanBytes(s.EstHeapChildren))
+	fmt.Fprintf(w, "  *ClassByte       : %s\n", humanBytes(s.EstHeapClassBytes))
+	fmt.Fprintf(w, "  *Aggregate hdr   : %s\n", humanBytes(s.EstHeapAggHeaders))
+	fmt.Fprintf(w, "  Aggregate.Bytes  : %s\n", humanBytes(s.EstHeapAggBytes))
+	fmt.Fprintf(w, "  TOTAL            : %s\n", humanBytes(s.EstHeapTotal))
+	if s.AliveNodes > 0 {
+		fmt.Fprintf(w, "  B / alive-node   : %.1f\n", float64(s.EstHeapTotal)/float64(s.AliveNodes))
+	}
+	if s.Leaves+s.InternalsWithFile > 0 {
+		fmt.Fprintf(w, "  B / object       : %.1f\n", float64(s.EstHeapTotal)/float64(s.Leaves+s.InternalsWithFile))
+	}
+
+	runtime.GC()
+	var m runtime.MemStats
+	runtime.ReadMemStats(&m)
+	runtime.KeepAlive(tree)
+	fmt.Fprintf(w, "\nruntime.HeapAlloc  : %s   (estimate covers %s of it)\n",
+		humanBytes(int64(m.HeapAlloc)), pct(s.EstHeapTotal, int64(m.HeapAlloc)))
+}
+
 // reportHeap prints a single stderr line with the current resident heap
 // after a forced GC. Called immediately after load/scan so the reported
 // number reflects the steady-state tree (transient allocations the

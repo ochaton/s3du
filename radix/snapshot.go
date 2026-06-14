@@ -60,36 +60,91 @@ var (
 	ErrSnapshotCorrupt = errors.New("radix: snapshot corrupt")
 )
 
-// Save writes the tree's binary snapshot to w. The on-disk representation
-// keyed by arena ID means children references are byte-identical before save
-// and after Load — no pointer fixup, no second pass.
+// Save writes the tree's binary snapshot to w.
 //
-// To skip free slots without allocating an O(nextID) presence bitmap, Save
-// makes a sorted copy of the freelist (typically tiny — only grows on prune-
-// heavy deletes) and walks it in lock-step with the slot iteration.
+// The on-disk format is unchanged from v1: a single contiguous ID space, one
+// record per alive node, internals expressed as nodes-with-children, leaves
+// expressed as nodes-with-file-and-no-children. Internals serialise first
+// (so the root keeps disk ID 0), leaves second. Child references in internal
+// records are rewritten via per-arena disk-ID mappings.
+//
+// To skip free slots without allocating O(nextX) presence bitmaps, Save
+// makes a sorted copy of each freelist (typically tiny — only grows on
+// prune-heavy deletes) and walks it in lock-step with the slot iteration.
 func (t *Tree) Save(w io.Writer) error {
 	bw := bufio.NewWriter(w)
 
-	sortedFree := append([]uint32(nil), t.free...)
-	slices.Sort(sortedFree)
-	aliveCount := t.nextID - uint32(len(sortedFree))
+	sortedFreeInt := append([]uint32(nil), t.freeInt...)
+	slices.Sort(sortedFreeInt)
+	sortedFreeLeaf := append([]uint32(nil), t.freeLeaf...)
+	slices.Sort(sortedFreeLeaf)
+
+	nInt := t.nextInt - uint32(len(sortedFreeInt))
+	nLeaf := t.nextLeaf - uint32(len(sortedFreeLeaf))
+	total := nInt + nLeaf
+
+	// Build arena-slot → disk-ID maps. Internals occupy [0, nInt); leaves
+	// occupy [nInt, total). Root (internal arena slot 0) maps to disk 0.
+	intDiskID := make([]uint32, t.nextInt)
+	{
+		fi := 0
+		var next uint32
+		for id := uint32(0); id < t.nextInt; id++ {
+			if fi < len(sortedFreeInt) && sortedFreeInt[fi] == id {
+				fi++
+				continue
+			}
+			intDiskID[id] = next
+			next++
+		}
+	}
+	leafDiskID := make([]uint32, t.nextLeaf)
+	{
+		fl := 0
+		next := nInt
+		for id := uint32(0); id < t.nextLeaf; id++ {
+			if fl < len(sortedFreeLeaf) && sortedFreeLeaf[fl] == id {
+				fl++
+				continue
+			}
+			leafDiskID[id] = next
+			next++
+		}
+	}
 
 	var maxID uint32
-	if t.nextID > 0 {
-		maxID = t.nextID - 1
+	if total > 0 {
+		maxID = total - 1
 	}
-	if err := writeHeader(bw, maxID, aliveCount); err != nil {
+	if err := writeHeader(bw, maxID, total); err != nil {
 		return err
 	}
 
-	freeIdx := 0
-	for id := uint32(0); id < t.nextID; id++ {
-		if freeIdx < len(sortedFree) && sortedFree[freeIdx] == id {
-			freeIdx++
+	mapChild := func(cid uint32) uint32 {
+		if isLeafID(cid) {
+			return leafDiskID[cid&idMask]
+		}
+		return intDiskID[cid]
+	}
+
+	fi := 0
+	for id := uint32(0); id < t.nextInt; id++ {
+		if fi < len(sortedFreeInt) && sortedFreeInt[fi] == id {
+			fi++
 			continue
 		}
-		if err := writeNodeRecord(bw, id, t.at(id)); err != nil {
-			return fmt.Errorf("radix: write node %d: %w", id, err)
+		if err := writeInternalRecord(bw, intDiskID[id], t.atInternal(id), mapChild); err != nil {
+			return fmt.Errorf("radix: write internal %d: %w", id, err)
+		}
+	}
+	fl := 0
+	for id := uint32(0); id < t.nextLeaf; id++ {
+		if fl < len(sortedFreeLeaf) && sortedFreeLeaf[fl] == id {
+			fl++
+			continue
+		}
+		if err := writeLeafRecord(bw, leafDiskID[id], t.atLeaf(id)); err != nil {
+			return fmt.Errorf("radix: write leaf %d: %w", id, err)
 		}
 	}
 	return bw.Flush()
@@ -99,10 +154,17 @@ func (t *Tree) Save(w io.Writer) error {
 // per-call overhead of bufio's underlying Read across many record bytes.
 const loadReadBuffer = 64 << 10
 
-// Load reads a snapshot previously produced by Save and reconstructs the
-// in-memory tree. Arena chunks are sized exactly to fit max_id+1 nodes; gaps
-// between alive IDs are recovered into the freelist so future inserts reuse
-// them.
+// Load reads a snapshot previously produced by Save (or any prior v1 writer)
+// and reconstructs the two-arena in-memory tree.
+//
+// Each record is classified into the internal or leaf arena as it is read
+// (a record is a leaf iff disk-ID != 0, file != nil, no children, no agg).
+// Children references are stored temporarily as disk IDs and rewritten in a
+// second pass via diskToCID once every record has been placed.
+//
+// Memory cost during load: arenas + diskToCID (4 B × maxID+1). At 50 M
+// objects diskToCID is ~300 MB, an order of magnitude smaller than the tree
+// itself.
 func Load(r io.Reader) (*Tree, error) {
 	br := bufio.NewReaderSize(r, loadReadBuffer)
 	maxID, aliveCount, err := readHeader(br)
@@ -110,31 +172,73 @@ func Load(r io.Reader) (*Tree, error) {
 		return nil, err
 	}
 
-	nextID := maxID + 1
-	t := &Tree{nextID: nextID}
-	chunkCount := int((uint32(nextID) + nodeChunkSize - 1) >> chunkBits)
-	t.chunks = make([][]node, chunkCount)
-	for i := range t.chunks {
-		t.chunks[i] = make([]node, nodeChunkSize)
-	}
+	t := &Tree{}
+	// Reserve internal slot 0 for the root. The root's actual edge/agg/file
+	// come from the disk-id=0 record below (which will overwrite the slot).
+	t.allocInternal(internal{})
 
+	nextID := maxID + 1
+	diskToCID := make([]uint32, nextID)
 	seen := make([]bool, nextID)
+	rootSeen := false
+
 	for i := range aliveCount {
-		id, n, err := readNodeRecord(br)
+		rec, err := readNodeRecord(br)
 		if err != nil {
 			return nil, fmt.Errorf("radix: read record %d: %w", i, err)
 		}
-		if id >= nextID || seen[id] {
+		if rec.id >= nextID || seen[rec.id] {
 			return nil, ErrSnapshotCorrupt
 		}
-		seen[id] = true
-		*t.at(id) = n
+		seen[rec.id] = true
+
+		isLeaf := rec.id != 0 && rec.file != nil && len(rec.children) == 0 && rec.agg == nil
+		if isLeaf {
+			cid := t.allocLeaf(leaf{
+				edge:      rec.edge,
+				sizeClass: packSizeClass(rec.file.Class, rec.file.Size),
+			})
+			diskToCID[rec.id] = cid
+			continue
+		}
+
+		var memID uint32
+		if rec.id == 0 {
+			memID = rootID
+			rootSeen = true
+		} else {
+			memID = t.allocInternal(internal{})
+		}
+		n := t.atInternal(memID)
+		n.edge = rec.edge
+		n.file = rec.file
+		n.agg = rec.agg
+		n.children = rec.children // disk IDs; rewritten below
+		diskToCID[rec.id] = memID
 	}
-	for id := range nextID {
-		if !seen[id] {
-			t.free = append(t.free, id)
+
+	if aliveCount > 0 && !rootSeen {
+		return nil, ErrSnapshotCorrupt
+	}
+
+	// Second pass: rewrite each internal.children using diskToCID.
+	for cIdx := range t.internals {
+		chunk := t.internals[cIdx]
+		for slot := range chunk {
+			id := uint32(cIdx<<chunkBits | slot)
+			if id >= t.nextInt {
+				break
+			}
+			n := &chunk[slot]
+			for j, c := range n.children {
+				if c >= nextID || !seen[c] {
+					return nil, ErrSnapshotCorrupt
+				}
+				n.children[j] = diskToCID[c]
+			}
 		}
 	}
+
 	return t, nil
 }
 
@@ -178,15 +282,15 @@ func LoadFile(path string) (*Tree, error) {
 	return Load(f)
 }
 
-// Export walks every alive leaf in lex order, calling yield with each
-// Object. Returning false from yield stops iteration early. Directory-marker
-// objects (keys terminating at internal nodes) are emitted too.
+// Export walks every alive object (regular leaves plus S3 directory-marker
+// dir-marker files held on internals) in lex order, calling yield with each
+// Object. Returning false from yield stops iteration early.
 func (t *Tree) Export(yield func(Object) bool) {
-	t.exportFromNode(rootID, "", yield)
+	t.exportFromInternal(rootID, "", yield)
 }
 
-func (t *Tree) exportFromNode(id uint32, prefix string, yield func(Object) bool) bool {
-	n := t.at(id)
+func (t *Tree) exportFromInternal(id uint32, prefix string, yield func(Object) bool) bool {
+	n := t.atInternal(id)
 	fullKey := prefix + n.edge
 	if n.file != nil {
 		if !yield(Object{Key: fullKey, Size: n.file.Size, Class: n.file.Class}) {
@@ -194,7 +298,14 @@ func (t *Tree) exportFromNode(id uint32, prefix string, yield func(Object) bool)
 		}
 	}
 	for _, cid := range n.children {
-		if !t.exportFromNode(cid, fullKey, yield) {
+		if isLeafID(cid) {
+			lf := t.atLeaf(cid & idMask)
+			if !yield(Object{Key: fullKey + lf.edge, Size: lf.size(), Class: lf.class()}) {
+				return false
+			}
+			continue
+		}
+		if !t.exportFromInternal(cid, fullKey, yield) {
 			return false
 		}
 	}
@@ -232,9 +343,9 @@ func readHeader(r io.Reader) (maxID, aliveCount uint32, err error) {
 	return maxID, aliveCount, nil
 }
 
-// writeNodeRecord serialises a single node into w. Layout matches the
-// per-record block documented at the top of this file.
-func writeNodeRecord(w *bufio.Writer, id uint32, n *node) error {
+// writeInternalRecord serialises an internal node as a v1-format record,
+// rewriting child references through mapChild so they refer to disk IDs.
+func writeInternalRecord(w *bufio.Writer, id uint32, n *internal, mapChild func(uint32) uint32) error {
 	var flags uint8
 	if n.file != nil {
 		flags |= snapFlagHasFile
@@ -242,8 +353,6 @@ func writeNodeRecord(w *bufio.Writer, id uint32, n *node) error {
 	if n.agg != nil {
 		flags |= snapFlagHasAgg
 	}
-
-	// id + flags + edge_len + children_n
 	var hdr [9]byte
 	binary.LittleEndian.PutUint32(hdr[0:4], id)
 	hdr[4] = flags
@@ -258,7 +367,7 @@ func writeNodeRecord(w *bufio.Writer, id uint32, n *node) error {
 	if len(n.children) > 0 {
 		var tmp [4]byte
 		for _, cid := range n.children {
-			binary.LittleEndian.PutUint32(tmp[:], cid)
+			binary.LittleEndian.PutUint32(tmp[:], mapChild(cid))
 			if _, err := w.Write(tmp[:]); err != nil {
 				return err
 			}
@@ -291,55 +400,88 @@ func writeNodeRecord(w *bufio.Writer, id uint32, n *node) error {
 	return nil
 }
 
-// readNodeRecord parses a single record from r and returns its ID and the
-// reconstructed node.
+// writeLeafRecord serialises a leaf as a v1-format record (no children, no
+// agg, hasFile). The packed sizeClass is unpacked back into (class, size)
+// for on-disk compatibility.
+func writeLeafRecord(w *bufio.Writer, id uint32, l *leaf) error {
+	var hdr [9]byte
+	binary.LittleEndian.PutUint32(hdr[0:4], id)
+	hdr[4] = snapFlagHasFile
+	binary.LittleEndian.PutUint16(hdr[5:7], uint16(len(l.edge)))
+	binary.LittleEndian.PutUint16(hdr[7:9], 0)
+	if _, err := w.Write(hdr[:]); err != nil {
+		return err
+	}
+	if _, err := w.WriteString(l.edge); err != nil {
+		return err
+	}
+	var fb [9]byte
+	fb[0] = uint8(l.class())
+	binary.LittleEndian.PutUint64(fb[1:9], uint64(l.size()))
+	_, err := w.Write(fb[:])
+	return err
+}
+
+// loadedRecord is the parsed form of a single v1 node record. Its children
+// references are still disk IDs at parse time; the caller of readNodeRecord
+// classifies the record into an internal or a leaf and (for internals)
+// rewrites children via the diskToCID map after every record is in place.
+type loadedRecord struct {
+	id       uint32
+	edge     string
+	children []uint32
+	file     *ClassByte
+	agg      *Aggregate
+}
+
+// readNodeRecord parses a single v1-format record from r.
 //
 // Variable-sized sub-blocks (edge bytes, children IDs, agg entries) are
 // read via bufio.Reader.Peek so the decoder operates directly on the
 // reader's internal buffer — no scratch []byte allocations per record. The
 // reader must therefore be sized large enough to hold any single sub-block
 // (loadReadBuffer = 64 KB covers the uint16-limited edge length).
-func readNodeRecord(r *bufio.Reader) (uint32, node, error) {
+func readNodeRecord(r *bufio.Reader) (loadedRecord, error) {
+	var rec loadedRecord
 	var hdr [9]byte
 	if _, err := io.ReadFull(r, hdr[:]); err != nil {
-		return 0, node{}, err
+		return rec, err
 	}
-	id := binary.LittleEndian.Uint32(hdr[0:4])
+	rec.id = binary.LittleEndian.Uint32(hdr[0:4])
 	flags := hdr[4]
 	edgeLen := binary.LittleEndian.Uint16(hdr[5:7])
 	childrenN := binary.LittleEndian.Uint16(hdr[7:9])
 
-	var n node
 	if edgeLen > 0 {
 		buf, err := r.Peek(int(edgeLen))
 		if err != nil {
-			return 0, node{}, err
+			return rec, err
 		}
-		n.edge = string(buf) // copies bytes into the string's own backing
+		rec.edge = string(buf) // copies bytes into the string's own backing
 		if _, err := r.Discard(int(edgeLen)); err != nil {
-			return 0, node{}, err
+			return rec, err
 		}
 	}
 	if childrenN > 0 {
 		nb := int(childrenN) * 4
 		buf, err := r.Peek(nb)
 		if err != nil {
-			return 0, node{}, err
+			return rec, err
 		}
-		n.children = make([]uint32, childrenN)
-		for i := range n.children {
-			n.children[i] = binary.LittleEndian.Uint32(buf[i*4:])
+		rec.children = make([]uint32, childrenN)
+		for i := range rec.children {
+			rec.children[i] = binary.LittleEndian.Uint32(buf[i*4:])
 		}
 		if _, err := r.Discard(nb); err != nil {
-			return 0, node{}, err
+			return rec, err
 		}
 	}
 	if flags&snapFlagHasFile != 0 {
 		var fb [9]byte
 		if _, err := io.ReadFull(r, fb[:]); err != nil {
-			return 0, node{}, err
+			return rec, err
 		}
-		n.file = &ClassByte{
+		rec.file = &ClassByte{
 			Class: StorageClass(fb[0]),
 			Size:  int64(binary.LittleEndian.Uint64(fb[1:9])),
 		}
@@ -347,7 +489,7 @@ func readNodeRecord(r *bufio.Reader) (uint32, node, error) {
 	if flags&snapFlagHasAgg != 0 {
 		var ah [9]byte
 		if _, err := io.ReadFull(r, ah[:]); err != nil {
-			return 0, node{}, err
+			return rec, err
 		}
 		agg := &Aggregate{Objects: int64(binary.LittleEndian.Uint64(ah[0:8]))}
 		aggN := ah[8]
@@ -355,7 +497,7 @@ func readNodeRecord(r *bufio.Reader) (uint32, node, error) {
 			nb := int(aggN) * 9
 			buf, err := r.Peek(nb)
 			if err != nil {
-				return 0, node{}, err
+				return rec, err
 			}
 			agg.Bytes = make(ClassBytes, aggN)
 			for i := range agg.Bytes {
@@ -366,10 +508,10 @@ func readNodeRecord(r *bufio.Reader) (uint32, node, error) {
 				}
 			}
 			if _, err := r.Discard(nb); err != nil {
-				return 0, node{}, err
+				return rec, err
 			}
 		}
-		n.agg = agg
+		rec.agg = agg
 	}
-	return id, n, nil
+	return rec, nil
 }

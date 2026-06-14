@@ -1,30 +1,69 @@
 package radix
 
 import (
+	"slices"
 	"sort"
 	"strings"
+	"unsafe"
 )
 
-// node is a single radix-tree node.
+// internal is a radix-tree branch node — it has children and, optionally,
+// a per-subtree Aggregate cache. A subset of internals also carry a file
+// pointer for the rare case of an S3 directory-marker object whose key lies
+// at the exact boundary of this node (107 out of 24 M internals on the
+// 50 M-object <bucket> bucket).
 //
 //	edge:     compressed path fragment from the parent node (empty only on root).
-//	children: child node IDs (indices into Tree.nodes). Sorted ascending by
-//	          the first byte of each child's edge; Patricia invariant
-//	          guarantees uniqueness among siblings.
-//	file:     non-nil iff a key terminates exactly at this node.
-//	agg:      non-nil for nodes that have ever been internal; nil for pure
-//	          leaves whose aggregate is derived on demand (see effectiveAgg).
-type node struct {
+//	children: child IDs, each tagged with leafTag if it points into the leaf arena.
+//	          Sorted ascending by the first byte of each child's edge; Patricia
+//	          invariant guarantees uniqueness among siblings.
+//	agg:      aggregate over the subtree, materialised on first contribution.
+//	file:     non-nil for S3 dir-marker objects pinned at this node.
+type internal struct {
 	edge     string
 	children []uint32
-	file     *ClassByte
 	agg      *Aggregate
+	file     *ClassByte
 }
 
-// effectiveAgg returns the aggregate over the subtree rooted at n. Pure leaves
-// (those whose agg pointer was never materialised) have their contribution
-// derived on the fly from file to keep their in-memory footprint small.
-func (n *node) effectiveAgg() Aggregate {
+// leaf is a terminal radix-tree node — a single S3 object's metadata.
+// sizeClass packs Size into bits 0..55 (max ~72 PB; S3 single-object cap is
+// 5 TB) and StorageClass into bits 56..63. There is no children slice and no
+// stored aggregate: the leaf's contribution to any ancestor aggregate is
+// derived on demand from (class, size).
+type leaf struct {
+	edge      string
+	sizeClass uint64
+}
+
+// Child IDs in internal.children are tagged uint32s: high bit set means the
+// low 31 bits index into the leaf arena, otherwise into the internal arena.
+// 2^31 nodes per arena is more than enough at any practical scale (1 G files
+// at ~100 B/object on a single 100 GiB host).
+const (
+	leafTag uint32 = 1 << 31
+	idMask  uint32 = leafTag - 1
+)
+
+// isLeafID reports whether cid points into the leaf arena.
+func isLeafID(cid uint32) bool { return cid&leafTag != 0 }
+
+const (
+	leafClassShift          = 56
+	leafSizeMask   uint64   = (1 << leafClassShift) - 1
+)
+
+func packSizeClass(class StorageClass, size int64) uint64 {
+	return uint64(size)&leafSizeMask | uint64(class)<<leafClassShift
+}
+
+func (l *leaf) class() StorageClass { return StorageClass(l.sizeClass >> leafClassShift) }
+func (l *leaf) size() int64         { return int64(l.sizeClass & leafSizeMask) }
+
+// effectiveAgg returns the aggregate over the subtree rooted at this internal.
+// When no Aggregate has been materialised the value is derived from the
+// dir-marker file (if any), keeping freshly-created empty internals zero-cost.
+func (n *internal) effectiveAgg() Aggregate {
 	if n.agg != nil {
 		return *n.agg
 	}
@@ -36,38 +75,48 @@ func (n *node) effectiveAgg() Aggregate {
 	return a
 }
 
+// leafAggregate returns the Aggregate a leaf contributes to its ancestors.
+func (l *leaf) effectiveAgg() Aggregate {
+	a := Aggregate{Objects: 1}
+	a.Bytes.Add(l.class(), l.size())
+	return a
+}
+
 // RootAggregate returns the aggregate over the whole tree (the radix root's
 // aggregate). O(1) — the aggregate is maintained incrementally on every
 // insert. Callers that just need the total object count or the per-class
 // bytes should use this instead of walking Export.
 func (t *Tree) RootAggregate() Aggregate {
-	return t.at(rootID).effectiveAgg()
+	return t.atInternal(rootID).effectiveAgg()
 }
 
 // Tree is an in-memory compressed radix tree over S3 object keys.
 //
-// Nodes live in a chunked arena (Tree.chunks). Each chunk is a fixed-size
-// []node whose backing array never moves, so any *node obtained from
-// [Tree.at] is stable for the lifetime of the Tree even as more nodes are
-// allocated. Children reference each other by uint32 ID (the linear index
-// into the conceptual concatenation of all chunks): a child ID survives
-// snapshot save/load unchanged because IDs are arena slot numbers, not
-// memory addresses. A freelist of released IDs is reused by [Tree.alloc]
-// so deletes do not permanently waste arena slots.
+// Branch nodes (with children and per-subtree aggregates) and terminal
+// leaves (single objects with no children) live in two separate chunked
+// arenas. Each chunk is a fixed-size slab whose backing array never moves,
+// so any pointer obtained from [Tree.atInternal] / [Tree.atLeaf] stays valid
+// for the lifetime of the Tree. Children reference one another by uint32 ID:
+// the high bit (leafTag) selects the arena and the low 31 bits index into it.
 //
-// The root is always at ID 0 and never released.
+// The root is an internal at ID 0 and is never released. A freelist per arena
+// reuses slots vacated by deletes.
 //
 // Concurrency: not safe for concurrent use. Callers must externally
-// serialize AddBatch / ListDirectory calls.
+// serialise AddBatch / ListDirectory calls.
 type Tree struct {
-	chunks [][]node // each entry is a fixed-size slab of nodeChunkSize nodes
-	nextID uint32   // next free ID assuming no freelist hits
-	free   []uint32
+	internals [][]internal
+	nextInt   uint32
+	freeInt   []uint32
+
+	leaves   [][]leaf
+	nextLeaf uint32
+	freeLeaf []uint32
 }
 
 // nodeChunkSize / chunkBits define the chunked arena geometry. Each chunk
-// is a fixed-size []node slab; once allocated, the backing array never
-// moves, which keeps *node pointers stable across [Tree.alloc] calls.
+// is a fixed-size slab; once allocated, the backing array never moves, which
+// keeps pointers stable across [Tree.allocInternal] / [Tree.allocLeaf] calls.
 // chunkBits is the binary log so that index decomposition uses shift + mask
 // instead of a divide.
 const (
@@ -76,48 +125,112 @@ const (
 	chunkMask     = nodeChunkSize - 1
 )
 
-// rootID is the arena ID reserved for the tree's root node.
+// rootID is the internal-arena ID reserved for the tree's root node.
 const rootID uint32 = 0
 
-// New returns an empty Tree.
+// New returns an empty Tree with the root internal already allocated.
 func New() *Tree {
 	t := &Tree{}
-	t.alloc(node{}) // rootID at ID 0
+	t.allocInternal(internal{}) // rootID at ID 0
 	return t
 }
 
-// at returns a pointer to the node with the given ID. The pointer is stable
-// for the lifetime of the Tree: subsequent [Tree.alloc] calls may extend the
-// arena with new chunks but never move existing ones.
-func (t *Tree) at(id uint32) *node {
-	return &t.chunks[id>>chunkBits][id&chunkMask]
+// atInternal returns a pointer to the internal node with the given untagged ID.
+func (t *Tree) atInternal(id uint32) *internal {
+	return &t.internals[id>>chunkBits][id&chunkMask]
 }
 
-// alloc places init in the next available arena slot (popped from the
-// freelist if one is available, otherwise carved from the current or a
-// freshly created chunk) and returns the slot ID.
-func (t *Tree) alloc(init node) uint32 {
-	if n := len(t.free); n > 0 {
-		id := t.free[n-1]
-		t.free = t.free[:n-1]
-		*t.at(id) = init
+// atLeaf returns a pointer to the leaf with the given untagged ID.
+func (t *Tree) atLeaf(id uint32) *leaf {
+	return &t.leaves[id>>chunkBits][id&chunkMask]
+}
+
+// allocInternal stores init in the next free internal slot and returns its
+// untagged ID. Children references must NOT have leafTag set when pointing
+// at internal IDs.
+func (t *Tree) allocInternal(init internal) uint32 {
+	if n := len(t.freeInt); n > 0 {
+		id := t.freeInt[n-1]
+		t.freeInt = t.freeInt[:n-1]
+		*t.atInternal(id) = init
 		return id
 	}
-	if int(t.nextID>>chunkBits) >= len(t.chunks) {
-		t.chunks = append(t.chunks, make([]node, nodeChunkSize))
+	if int(t.nextInt>>chunkBits) >= len(t.internals) {
+		t.internals = append(t.internals, make([]internal, nodeChunkSize))
 	}
-	id := t.nextID
-	t.nextID++
-	*t.at(id) = init
+	id := t.nextInt
+	t.nextInt++
+	*t.atInternal(id) = init
 	return id
 }
 
-// release clears the slot at id and pushes the ID onto the freelist for
-// future reuse. The cleared slot drops references so the GC can reclaim any
-// edge / file / agg / children backings the node held.
-func (t *Tree) release(id uint32) {
-	*t.at(id) = node{}
-	t.free = append(t.free, id)
+// allocLeaf stores init in the next free leaf slot and returns its TAGGED ID
+// (high bit set). Callers can use the returned value as a child reference
+// directly.
+func (t *Tree) allocLeaf(init leaf) uint32 {
+	if n := len(t.freeLeaf); n > 0 {
+		id := t.freeLeaf[n-1]
+		t.freeLeaf = t.freeLeaf[:n-1]
+		*t.atLeaf(id) = init
+		return id | leafTag
+	}
+	if int(t.nextLeaf>>chunkBits) >= len(t.leaves) {
+		t.leaves = append(t.leaves, make([]leaf, nodeChunkSize))
+	}
+	id := t.nextLeaf
+	t.nextLeaf++
+	*t.atLeaf(id) = init
+	return id | leafTag
+}
+
+// releaseInternal clears the internal slot at id and pushes the ID onto the
+// freelist. Drops references so the GC can reclaim the edge string, agg, and
+// children backings the node held.
+func (t *Tree) releaseInternal(id uint32) {
+	*t.atInternal(id) = internal{}
+	t.freeInt = append(t.freeInt, id)
+}
+
+// releaseLeaf clears the leaf slot at the given untagged ID and pushes it on
+// the leaf freelist.
+func (t *Tree) releaseLeaf(id uint32) {
+	*t.atLeaf(id) = leaf{}
+	t.freeLeaf = append(t.freeLeaf, id)
+}
+
+// releaseChild releases whichever arena the tagged child ID points into.
+func (t *Tree) releaseChild(cid uint32) {
+	if isLeafID(cid) {
+		t.releaseLeaf(cid & idMask)
+	} else {
+		t.releaseInternal(cid)
+	}
+}
+
+// firstByteOf returns the first byte of the edge stored at the child cid.
+// Used by binary search over children, which sorts on this byte.
+func (t *Tree) firstByteOf(cid uint32) byte {
+	if isLeafID(cid) {
+		return t.atLeaf(cid & idMask).edge[0]
+	}
+	return t.atInternal(cid).edge[0]
+}
+
+// edgeOf returns the edge stored at the child cid.
+func (t *Tree) edgeOf(cid uint32) string {
+	if isLeafID(cid) {
+		return t.atLeaf(cid & idMask).edge
+	}
+	return t.atInternal(cid).edge
+}
+
+// aggOfChild returns the Aggregate that the child cid contributes to its
+// parent's subtree total.
+func (t *Tree) aggOfChild(cid uint32) Aggregate {
+	if isLeafID(cid) {
+		return t.atLeaf(cid & idMask).effectiveAgg()
+	}
+	return t.atInternal(cid).effectiveAgg()
 }
 
 // AddBatch ingests a contiguous range of objects. See [Batch] for the
@@ -209,36 +322,44 @@ func (t *Tree) ListDirectory(prefix string) ([]Entry, error) {
 	id := rootID
 	rem := prefix
 	for {
-		n := t.at(id)
+		n := t.atInternal(id)
 		if rem == "" {
-			return t.listAtNode(n), nil
+			return t.listAtInternal(n), nil
 		}
 		idx, ok := t.findChild(n.children, rem[0])
 		if !ok {
 			return nil, nil
 		}
-		childID := n.children[idx]
-		child := t.at(childID)
-		if len(rem) >= len(child.edge) && rem[:len(child.edge)] == child.edge {
-			id = childID
-			rem = rem[len(child.edge):]
+		childCID := n.children[idx]
+		childEdge := t.edgeOf(childCID)
+		if len(rem) >= len(childEdge) && rem[:len(childEdge)] == childEdge {
+			if isLeafID(childCID) {
+				// rem extends past a leaf's edge: prefix matches more bytes
+				// than the leaf has; nothing lives below a leaf.
+				if len(rem) > len(childEdge) {
+					return nil, nil
+				}
+				return t.listAtLeaf(t.atLeaf(childCID&idMask)), nil
+			}
+			id = childCID
+			rem = rem[len(childEdge):]
 			continue
 		}
-		if len(rem) < len(child.edge) && child.edge[:len(rem)] == rem {
+		if len(rem) < len(childEdge) && childEdge[:len(rem)] == rem {
 			// prefix ends inside this compressed edge: single chain — emit at most
 			// one entry (either a subdirectory whose name extends to the next '/'
 			// in the edge, or a file if no '/' remains).
-			return t.listInsideEdge(child, rem), nil
+			return t.listInsideEdge(childCID, rem), nil
 		}
 		return nil, nil
 	}
 }
 
-// listAtNode lists the entries reachable from n without crossing a '/'.
+// listAtInternal lists entries reachable from internal n without crossing '/'.
 // When the requested prefix lands exactly on a node boundary, n.file (if any)
 // is the directory-marker object at that prefix and is emitted with an empty
 // name so callers may distinguish or filter it.
-func (t *Tree) listAtNode(n *node) []Entry {
+func (t *Tree) listAtInternal(n *internal) []Entry {
 	out := make([]Entry, 0, len(n.children)+1)
 	if n.file != nil {
 		out = append(out, Entry{
@@ -249,52 +370,74 @@ func (t *Tree) listAtNode(n *node) []Entry {
 		})
 	}
 	for _, cid := range n.children {
-		out = t.emitFromNode(cid, "", out)
+		out = t.emitFromChild(cid, "", out)
 	}
 	return out
+}
+
+// listAtLeaf handles the edge case where the requested prefix lands exactly
+// on a leaf boundary — only the leaf's file itself is reachable.
+func (t *Tree) listAtLeaf(l *leaf) []Entry {
+	return []Entry{{Name: "", IsDir: false, Class: l.class(), Size: l.size()}}
 }
 
 // listInsideEdge handles the case where the prefix lands strictly inside a
 // compressed edge. The residual edge bytes after the prefix form the suffix
 // that all entries in this logical directory share.
-func (t *Tree) listInsideEdge(child *node, consumed string) []Entry {
-	residual := child.edge[len(consumed):]
+func (t *Tree) listInsideEdge(cid uint32, consumed string) []Entry {
+	edge := t.edgeOf(cid)
+	residual := edge[len(consumed):]
 	if i := strings.IndexByte(residual, '/'); i >= 0 {
 		return []Entry{{
 			Name:      residual[:i+1],
 			IsDir:     true,
-			Aggregate: child.effectiveAgg(),
+			Aggregate: t.aggOfChild(cid),
 		}}
 	}
-	out := make([]Entry, 0, len(child.children)+1)
-	if child.file != nil {
+	if isLeafID(cid) {
+		l := t.atLeaf(cid & idMask)
+		return []Entry{{Name: residual, IsDir: false, Class: l.class(), Size: l.size()}}
+	}
+	n := t.atInternal(cid)
+	out := make([]Entry, 0, len(n.children)+1)
+	if n.file != nil {
 		out = append(out, Entry{
 			Name:  residual,
 			IsDir: false,
-			Class: child.file.Class,
-			Size:  child.file.Size,
+			Class: n.file.Class,
+			Size:  n.file.Size,
 		})
 	}
-	for _, cid := range child.children {
-		out = t.emitFromNode(cid, residual, out)
+	for _, c := range n.children {
+		out = t.emitFromChild(c, residual, out)
 	}
 	return out
 }
 
-// emitFromNode appends all logical-dir entries reachable from the node at id
+// emitFromChild appends all logical-dir entries reachable from the child cid
 // without crossing a '/' to out and returns the resulting slice. acc is the
 // bytes accumulated from the parent boundary node down to (but not including)
-// the node's edge.
-func (t *Tree) emitFromNode(id uint32, acc string, out []Entry) []Entry {
-	n := t.at(id)
-	if i := strings.IndexByte(n.edge, '/'); i >= 0 {
+// the child's edge.
+func (t *Tree) emitFromChild(cid uint32, acc string, out []Entry) []Entry {
+	edge := t.edgeOf(cid)
+	if i := strings.IndexByte(edge, '/'); i >= 0 {
 		return append(out, Entry{
-			Name:      acc + n.edge[:i+1],
+			Name:      acc + edge[:i+1],
 			IsDir:     true,
-			Aggregate: n.effectiveAgg(),
+			Aggregate: t.aggOfChild(cid),
 		})
 	}
-	fullName := acc + n.edge
+	fullName := acc + edge
+	if isLeafID(cid) {
+		l := t.atLeaf(cid & idMask)
+		return append(out, Entry{
+			Name:  fullName,
+			IsDir: false,
+			Class: l.class(),
+			Size:  l.size(),
+		})
+	}
+	n := t.atInternal(cid)
 	if n.file != nil {
 		out = append(out, Entry{
 			Name:  fullName,
@@ -303,8 +446,8 @@ func (t *Tree) emitFromNode(id uint32, acc string, out []Entry) []Entry {
 			Size:  n.file.Size,
 		})
 	}
-	for _, cid := range n.children {
-		out = t.emitFromNode(cid, fullName, out)
+	for _, c := range n.children {
+		out = t.emitFromChild(c, fullName, out)
 	}
 	return out
 }
@@ -313,9 +456,9 @@ func (t *Tree) emitFromNode(id uint32, acc string, out []Entry) []Entry {
 // Returns (index, found). When found is false, index is the insertion point.
 func (t *Tree) findChild(children []uint32, b byte) (int, bool) {
 	i := sort.Search(len(children), func(i int) bool {
-		return t.at(children[i]).edge[0] >= b
+		return t.firstByteOf(children[i]) >= b
 	})
-	if i < len(children) && t.at(children[i]).edge[0] == b {
+	if i < len(children) && t.firstByteOf(children[i]) == b {
 		return i, true
 	}
 	return i, false
@@ -382,18 +525,15 @@ func (t *Tree) insertBatch(objs []Object) {
 
 // insertFromPath resumes the descent of obj.Key from the top of path. It
 // mutates the tree as needed (creating leaves, splitting compressed edges)
-// and extends path with each visited node. The returned path terminates at
-// obj's destination so the caller can reuse it for the next insert.
+// and extends path with each visited internal node. The returned path
+// terminates at obj's parent so the caller can reuse it for the next insert.
 //
-// Aggregate bookkeeping is top-down: obj contributes one object and Size
-// bytes to every ancestor on its descent path. The frames already in path
-// when this function runs are exactly the ancestors carried over from the
-// previous insert that are still ancestors of obj (the others were popped
-// against the LCP). We bump them once up-front, then bump each new node we
-// step into during the descent — never the same node twice.
+// path frames hold INTERNAL IDs only — leaves can have no descendants, so
+// they never appear on a descent path. The bookkeeping invariant is: every
+// frame in path is an internal ancestor whose Aggregate must reflect obj.
 //
-// Because the arena is chunked, *node pointers stay valid across [Tree.alloc]
-// calls — no refresh dance needed.
+// Because both arenas are chunked, *internal and *leaf pointers stay valid
+// across allocation calls — no refresh dance needed.
 func (t *Tree) insertFromPath(path []framePath, obj Object) []framePath {
 	for _, f := range path {
 		t.bumpAgg(f.id, obj)
@@ -404,11 +544,10 @@ func (t *Tree) insertFromPath(path []framePath, obj Object) []framePath {
 	key := obj.Key[consumed:]
 
 	for {
-		n := t.at(id)
+		n := t.atInternal(id)
 		if key == "" {
-			// The key terminates exactly at n; n becomes a "file leaf"
-			// (or gains its file marker if it was a pure intermediate).
-			// n.agg was already bumped via the path pre-walk.
+			// key terminates exactly at internal n: it becomes (or remains)
+			// a directory-marker node. n.agg was already bumped above.
 			n.file = &ClassByte{Class: obj.Class, Size: obj.Size}
 			return path
 		}
@@ -416,29 +555,32 @@ func (t *Tree) insertFromPath(path []framePath, obj Object) []framePath {
 		idx, ok := t.findChild(n.children, key[0])
 		if !ok {
 			// No sibling shares the next byte — attach the remainder of
-			// the key as a brand-new leaf. The leaf's own aggregate is
-			// derived on demand from its file (effectiveAgg).
+			// the key as a brand-new leaf in the leaf arena.
 			//
 			// strings.Clone is critical here (and at every other edge
-			// assignment in this function): without it the edge would be
-			// a slice header pointing into the caller's batch key string,
-			// keeping the whole multi-hundred-byte source string alive
-			// for the lifetime of the tree. At ten-of-millions-of-objects
-			// scale that retention dwarfs the radix nodes themselves.
-			leafID := t.alloc(node{
-				edge: strings.Clone(key),
-				file: &ClassByte{Class: obj.Class, Size: obj.Size},
+			// assignment in this function): without it the edge would be a
+			// slice header pointing into the caller's batch key string,
+			// pinning the whole multi-hundred-byte source string for the
+			// lifetime of the tree. At tens-of-millions-of-objects scale
+			// that retention dwarfs the radix nodes themselves.
+			leafCID := t.allocLeaf(leaf{
+				edge:      strings.Clone(key),
+				sizeClass: packSizeClass(obj.Class, obj.Size),
 			})
-			n.children = insertChildAt(n.children, idx, leafID)
-			return append(path, framePath{id: leafID, consumed: consumed + len(key)})
+			n.children = insertChildAt(n.children, idx, leafCID)
+			return path
 		}
 
-		childID := n.children[idx]
-		child := t.at(childID)
+		childCID := n.children[idx]
+		if isLeafID(childCID) {
+			return t.insertAgainstLeafChild(path, id, idx, childCID, obj, key, consumed)
+		}
+		childID := childCID
+		child := t.atInternal(childID)
 		lcp := longestCommonPrefix(child.edge, key)
 		if lcp == len(child.edge) {
 			// The whole edge is a prefix of the remaining key — descend
-			// into child and continue the loop one level deeper.
+			// into the internal child and continue one level deeper.
 			t.bumpAgg(childID, obj)
 			id = childID
 			consumed += lcp
@@ -447,43 +589,122 @@ func (t *Tree) insertFromPath(path []framePath, obj Object) []framePath {
 			continue
 		}
 
-		// child.edge and key diverge after lcp bytes. Build an intermediate
-		// node carrying the shared prefix, shrink child to its remainder,
-		// and place obj either at the intermediate itself (if its key ends
-		// exactly at lcp) or as a brand-new sibling leaf. child.edge is
-		// already owned (was cloned on its own insert) — slicing it stays
-		// on its private backing.
-		intAgg := t.aggForSplit(childID, obj)
-		intID := t.alloc(node{edge: child.edge[:lcp], agg: intAgg})
-		child.edge = child.edge[lcp:]
+		// Internal child's edge and the new key diverge after lcp bytes.
+		// Build an intermediate internal at lcp, shrink the existing child
+		// to its remainder, and place obj either at the intermediate (if
+		// the new key ends exactly at lcp) or as a brand-new sibling leaf.
+		intAgg := t.aggForSplitInternalChild(childID, obj)
+		intID := t.allocInternal(internal{edge: child.edge[:lcp], agg: intAgg})
+		t.atInternal(childID).edge = t.atInternal(childID).edge[lcp:]
 
 		if lcp == len(key) {
-			inter := t.at(intID)
+			inter := t.atInternal(intID)
 			inter.file = &ClassByte{Class: obj.Class, Size: obj.Size}
-			inter.children = []uint32{childID}
-			n.children[idx] = intID
+			inter.children = []uint32{childCID}
+			t.atInternal(id).children[idx] = intID
 			return append(path, framePath{id: intID, consumed: consumed + lcp})
 		}
 
-		leafID := t.alloc(node{
-			edge: strings.Clone(key[lcp:]),
-			file: &ClassByte{Class: obj.Class, Size: obj.Size},
+		leafCID := t.allocLeaf(leaf{
+			edge:      strings.Clone(key[lcp:]),
+			sizeClass: packSizeClass(obj.Class, obj.Size),
 		})
-		t.at(intID).children = t.sortChildren(childID, leafID)
-		n.children[idx] = intID
-		return append(path,
-			framePath{id: intID, consumed: consumed + lcp},
-			framePath{id: leafID, consumed: consumed + len(key)},
-		)
+		t.atInternal(intID).children = t.sortChildren(childCID, leafCID)
+		t.atInternal(id).children[idx] = intID
+		return append(path, framePath{id: intID, consumed: consumed + lcp})
 	}
 }
 
-// bumpAgg adds obj's contribution (one object, one Size-byte entry under
-// obj.Class) to the aggregate of the node at id. If the node is a pure leaf
-// that has never carried a materialised aggregate, one is allocated here from
-// its file metadata.
+// insertAgainstLeafChild handles the descent step when the next child is a
+// leaf. It dispatches between three shapes:
+//
+//   - leaf and key diverge after lcp: new intermediate at lcp, leaf becomes
+//     child with trimmed edge, new leaf for key remainder.
+//   - leaf is exact prefix of key: convert leaf to internal-with-file (the
+//     internal carries the leaf's edge and its old class/size as a dir-marker)
+//     and attach a brand-new leaf for the key remainder.
+//   - exact match: caller invariant (no duplicates) violated; overwrite
+//     class/size as a best-effort recovery.
+func (t *Tree) insertAgainstLeafChild(path []framePath, parentID uint32, childSlot int, childCID uint32, obj Object, key string, consumed int) []framePath {
+	leafID := childCID & idMask
+	lf := t.atLeaf(leafID)
+	lcp := longestCommonPrefix(lf.edge, key)
+
+	if lcp == len(lf.edge) && lcp == len(key) {
+		// Exact match — caller should have filtered as an update, not an insert.
+		// Overwrite class/size; ancestor aggs are now slightly inconsistent
+		// (the bumpAgg pre-walk added a fresh contribution). This branch matches
+		// the legacy behaviour for the internal-with-file overwrite case.
+		lf.sizeClass = packSizeClass(obj.Class, obj.Size)
+		return path
+	}
+
+	if lcp == len(lf.edge) {
+		// Leaf's edge is a strict prefix of key: convert leaf into an
+		// internal-with-file and attach a new leaf for the key suffix.
+		oldClass := lf.class()
+		oldSize := lf.size()
+
+		var ag Aggregate
+		ag.Objects = 2
+		ag.Bytes.Add(oldClass, oldSize)
+		ag.Bytes.Add(obj.Class, obj.Size)
+		intID := t.allocInternal(internal{
+			edge: lf.edge,
+			file: &ClassByte{Class: oldClass, Size: oldSize},
+			agg:  &ag,
+		})
+		t.releaseLeaf(leafID)
+
+		newLeafCID := t.allocLeaf(leaf{
+			edge:      strings.Clone(key[lcp:]),
+			sizeClass: packSizeClass(obj.Class, obj.Size),
+		})
+		t.atInternal(intID).children = []uint32{newLeafCID}
+		t.atInternal(parentID).children[childSlot] = intID
+		return append(path, framePath{id: intID, consumed: consumed + lcp})
+	}
+
+	// lcp < len(lf.edge): leaf and key diverge after lcp.
+	// New intermediate internal carries lcp; the existing leaf gets its edge
+	// trimmed to the remainder and stays a leaf.
+	var ag Aggregate
+	ag.Objects = 2
+	ag.Bytes.Add(lf.class(), lf.size())
+	ag.Bytes.Add(obj.Class, obj.Size)
+	intID := t.allocInternal(internal{edge: lf.edge[:lcp], agg: &ag})
+
+	if lcp == len(key) {
+		// key ends exactly at the new internal — it picks up obj as a
+		// dir-marker. The existing leaf gets trimmed and lives on as the
+		// sole child.
+		lf.edge = lf.edge[lcp:]
+		inter := t.atInternal(intID)
+		inter.file = &ClassByte{Class: obj.Class, Size: obj.Size}
+		// Reduce double-count from ag (we set Objects=2 above but the
+		// internal itself counts as one of those two now via inter.file).
+		// inter.effectiveAgg derives one object from file; ag already has
+		// it. Correct: leave Objects=2 — they are the leaf + the new file.
+		inter.children = []uint32{childCID}
+		t.atInternal(parentID).children[childSlot] = intID
+		return append(path, framePath{id: intID, consumed: consumed + lcp})
+	}
+
+	lf.edge = lf.edge[lcp:]
+	newLeafCID := t.allocLeaf(leaf{
+		edge:      strings.Clone(key[lcp:]),
+		sizeClass: packSizeClass(obj.Class, obj.Size),
+	})
+	t.atInternal(intID).children = t.sortChildren(childCID, newLeafCID)
+	t.atInternal(parentID).children[childSlot] = intID
+	return append(path, framePath{id: intID, consumed: consumed + lcp})
+}
+
+// bumpAgg adds obj's contribution to the aggregate of the internal at id.
+// If the internal has no materialised aggregate yet, one is allocated from
+// its effective view (file alone, or zero).
 func (t *Tree) bumpAgg(id uint32, obj Object) {
-	n := t.at(id)
+	n := t.atInternal(id)
 	if n.agg == nil {
 		a := n.effectiveAgg()
 		n.agg = &a
@@ -492,16 +713,14 @@ func (t *Tree) bumpAgg(id uint32, obj Object) {
 	n.agg.Bytes.Add(obj.Class, obj.Size)
 }
 
-// aggForSplit builds the aggregate that the new intermediate produced by a
-// split should carry. It is child's existing aggregate plus one new object
-// from obj.
+// aggForSplitInternalChild builds the aggregate that the new intermediate
+// produced by splitting an existing internal child should carry. It is the
+// child's existing aggregate plus one new object from obj.
 //
-// If child is already internal we cannot simply alias its Bytes slice — the
-// in-place Add below would also overwrite child.agg.Bytes via the shared
-// backing. effectiveAgg returns a fresh Aggregate for pure leaves, so in
-// that case we adopt it directly without copying.
-func (t *Tree) aggForSplit(childID uint32, obj Object) *Aggregate {
-	child := t.at(childID)
+// child.agg.Bytes cannot be aliased — the in-place Add below would corrupt
+// child.agg.Bytes via the shared backing.
+func (t *Tree) aggForSplitInternalChild(childID uint32, obj Object) *Aggregate {
+	child := t.atInternal(childID)
 	var a Aggregate
 	if child.agg != nil {
 		a.Objects = child.agg.Objects + 1
@@ -516,24 +735,27 @@ func (t *Tree) aggForSplit(childID uint32, obj Object) *Aggregate {
 	return &a
 }
 
-// sortChildren returns a 2-element child slice sorted ascending by the
-// first byte of each child's edge.
+// sortChildren returns a 2-element child slice sorted ascending by the first
+// byte of each child's edge. Either argument may be tagged or untagged.
 func (t *Tree) sortChildren(a, b uint32) []uint32 {
-	if t.at(a).edge[0] < t.at(b).edge[0] {
+	if t.firstByteOf(a) < t.firstByteOf(b) {
 		return []uint32{a, b}
 	}
 	return []uint32{b, a}
 }
 
+// deletePop is one entry in the descent record used by deleteKey to drive
+// bottom-up compression after a key is removed.
+type deletePop struct {
+	parentID uint32
+	childIdx int
+}
+
 // deleteKey removes key from the tree and propagates the negative aggregate
 // delta. Empty branches are pruned and single-child compression is restored.
-// Pruned nodes are released back to the arena freelist for reuse.
+// Pruned arena slots return to their respective freelists.
 func (t *Tree) deleteKey(key string) {
-	type pop struct {
-		parentID uint32
-		childIdx int
-	}
-	pops := make([]pop, 0, 8)
+	pops := make([]deletePop, 0, 8)
 	path := make([]framePath, 1, 8)
 	path[0] = framePath{id: rootID, consumed: 0}
 	curID := rootID
@@ -541,57 +763,85 @@ func (t *Tree) deleteKey(key string) {
 	consumed := 0
 
 	for rem != "" {
-		cur := t.at(curID)
+		cur := t.atInternal(curID)
 		idx, ok := t.findChild(cur.children, rem[0])
 		if !ok {
 			return
 		}
-		childID := cur.children[idx]
-		child := t.at(childID)
-		if !strings.HasPrefix(rem, child.edge) {
+		childCID := cur.children[idx]
+		childEdge := t.edgeOf(childCID)
+		if !strings.HasPrefix(rem, childEdge) {
 			return
 		}
-		pops = append(pops, pop{parentID: curID, childIdx: idx})
-		curID = childID
-		consumed += len(child.edge)
-		rem = rem[len(child.edge):]
-		path = append(path, framePath{id: childID, consumed: consumed})
+		consumed += len(childEdge)
+		rem = rem[len(childEdge):]
+		if isLeafID(childCID) {
+			// Terminal: leaf is the file we want to delete. Must match the
+			// full key — anything remaining means the key isn't in the tree.
+			if rem != "" {
+				return
+			}
+			lf := t.atLeaf(childCID & idMask)
+			class, size := lf.class(), lf.size()
+			t.applyDelta(path, class, -size, -1)
+			// Detach from parent and release the leaf slot.
+			cur.children = append(cur.children[:idx], cur.children[idx+1:]...)
+			t.releaseLeaf(childCID & idMask)
+			t.compressAfterDelete(pops)
+			return
+		}
+		pops = append(pops, deletePop{parentID: curID, childIdx: idx})
+		curID = childCID
+		path = append(path, framePath{id: curID, consumed: consumed})
 	}
-	cur := t.at(curID)
+
+	// rem == "" terminated at an internal node — the file we want is the
+	// dir-marker at curID (if any).
+	cur := t.atInternal(curID)
 	if cur.file == nil {
 		return
 	}
-	// applyDelta materialises leaf aggregates via effectiveAgg(), which reads
-	// cur.file. Subtract before clearing the file pointer.
 	class, size := cur.file.Class, cur.file.Size
 	t.applyDelta(path, class, -size, -1)
-	t.at(curID).file = nil
+	cur.file = nil
+	t.compressAfterDelete(pops)
+}
 
-	// Bottom-up cleanup: prune empty leaves; merge single-child no-file nodes
-	// back into a single compressed edge. Pruned IDs return to the freelist.
+// compressAfterDelete walks the parents recorded on the descent and prunes /
+// merges single-child no-file internals to restore radix compression.
+func (t *Tree) compressAfterDelete(pops []deletePop) {
 	for i := len(pops) - 1; i >= 0; i-- {
 		fr := pops[i]
-		parent := t.at(fr.parentID)
-		childID := parent.children[fr.childIdx]
-		child := t.at(childID)
+		parent := t.atInternal(fr.parentID)
+		childCID := parent.children[fr.childIdx]
+		// Leaf children cannot become unreferenced via compression — they
+		// only disappear via direct deletion. Stop the compression walk.
+		if isLeafID(childCID) {
+			return
+		}
+		child := t.atInternal(childCID)
 		switch {
 		case child.file == nil && len(child.children) == 0:
 			parent.children = append(parent.children[:fr.childIdx], parent.children[fr.childIdx+1:]...)
-			t.release(childID)
+			t.releaseInternal(childCID)
 		case child.file == nil && len(child.children) == 1:
-			onlyID := child.children[0]
-			only := t.at(onlyID)
-			only.edge = child.edge + only.edge
-			t.at(fr.parentID).children[fr.childIdx] = onlyID
-			t.release(childID)
+			onlyCID := child.children[0]
+			mergedEdge := child.edge + t.edgeOf(onlyCID)
+			if isLeafID(onlyCID) {
+				t.atLeaf(onlyCID & idMask).edge = mergedEdge
+			} else {
+				t.atInternal(onlyCID).edge = mergedEdge
+			}
+			parent.children[fr.childIdx] = onlyCID
+			t.releaseInternal(childCID)
 		default:
 			return
 		}
 	}
 }
 
-// updateKey changes the file metadata for an existing key and adjusts
-// aggregates by the difference. Assumes the key currently exists.
+// updateKey changes the metadata for an existing key and adjusts aggregates
+// by the difference. Assumes the key currently exists (caller filters).
 func (t *Tree) updateKey(obj Object) {
 	path := make([]framePath, 1, 8)
 	path[0] = framePath{id: rootID, consumed: 0}
@@ -599,38 +849,53 @@ func (t *Tree) updateKey(obj Object) {
 	rem := obj.Key
 	consumed := 0
 	for rem != "" {
-		cur := t.at(curID)
+		cur := t.atInternal(curID)
 		idx, ok := t.findChild(cur.children, rem[0])
 		if !ok {
 			return
 		}
-		childID := cur.children[idx]
-		child := t.at(childID)
-		if !strings.HasPrefix(rem, child.edge) {
+		childCID := cur.children[idx]
+		childEdge := t.edgeOf(childCID)
+		if !strings.HasPrefix(rem, childEdge) {
 			return
 		}
-		curID = childID
-		consumed += len(child.edge)
-		rem = rem[len(child.edge):]
+		consumed += len(childEdge)
+		rem = rem[len(childEdge):]
+		if isLeafID(childCID) {
+			if rem != "" {
+				return
+			}
+			lf := t.atLeaf(childCID & idMask)
+			oldClass, oldSize := lf.class(), lf.size()
+			if oldClass == obj.Class {
+				if d := obj.Size - oldSize; d != 0 {
+					t.applyDelta(path, obj.Class, d, 0)
+				}
+				lf.sizeClass = packSizeClass(obj.Class, obj.Size)
+				return
+			}
+			t.applyDelta(path, oldClass, -oldSize, -1)
+			lf.sizeClass = packSizeClass(obj.Class, obj.Size)
+			t.applyDelta(path, obj.Class, obj.Size, +1)
+			return
+		}
+		curID = childCID
 		path = append(path, framePath{id: curID, consumed: consumed})
 	}
-	cur := t.at(curID)
+	cur := t.atInternal(curID)
 	if cur.file == nil {
 		return
 	}
 	oldClass, oldSize := cur.file.Class, cur.file.Size
-	// applyDelta lazily materialises a leaf's aggregate via effectiveAgg,
-	// which reads cur.file. The old contribution must be subtracted before
-	// the file is overwritten.
 	if oldClass == obj.Class {
 		if d := obj.Size - oldSize; d != 0 {
 			t.applyDelta(path, obj.Class, d, 0)
 		}
-		t.at(curID).file.Size = obj.Size
+		cur.file.Size = obj.Size
 		return
 	}
 	t.applyDelta(path, oldClass, -oldSize, -1)
-	t.at(curID).file = &ClassByte{Class: obj.Class, Size: obj.Size}
+	cur.file = &ClassByte{Class: obj.Class, Size: obj.Size}
 	t.applyDelta(path, obj.Class, obj.Size, +1)
 }
 
@@ -650,13 +915,12 @@ func (t *Tree) deleteBatch(keys []string) {
 	}
 }
 
-// applyDelta walks the path from root to leaf applying the per-class byte
-// delta and the object-count delta to each node's aggregate. Aggregates are
-// materialised lazily — leaves that previously omitted their agg field get it
-// allocated here on first touch.
+// applyDelta walks the descent path applying the per-class byte delta and
+// the object-count delta to each internal's aggregate. The path contains
+// internal IDs only (leaves cannot have descendants and so never appear).
 func (t *Tree) applyDelta(path []framePath, class StorageClass, sizeDelta, objDelta int64) {
 	for i := range path {
-		n := t.at(path[i].id)
+		n := t.atInternal(path[i].id)
 		if n.agg == nil {
 			a := n.effectiveAgg()
 			n.agg = &a
@@ -706,10 +970,14 @@ func (t *Tree) newRangeCursor(lo, hi string) *rangeCursor {
 // Next returns the next object whose key falls in (lo, hi], in ascending lex
 // order. Returns (_, false) once the iteration is exhausted; subsequent calls
 // continue to return false.
+//
+// Stack frames hold INTERNAL IDs only; leaf children are emitted inline as
+// the descent visits each child slot without pushing a new frame, since
+// leaves have no further descent.
 func (rc *rangeCursor) Next() (Object, bool) {
 	for len(rc.stack) > 0 {
 		top := &rc.stack[len(rc.stack)-1]
-		n := rc.t.at(top.id)
+		n := rc.t.atInternal(top.id)
 		if !top.fileEmitted {
 			top.fileEmitted = true
 			if n.file != nil && top.prefix > rc.lo && top.prefix <= rc.hi {
@@ -722,12 +990,19 @@ func (rc *rangeCursor) Next() (Object, bool) {
 		}
 		cid := n.children[top.nextChild]
 		top.nextChild++
-		c := rc.t.at(cid)
-		childKey := top.prefix + c.edge
+		childEdge := rc.t.edgeOf(cid)
+		childKey := top.prefix + childEdge
 		// All subsequent siblings have a strictly greater first byte, hence
 		// strictly greater childKey — once one exceeds hi, pop the frame.
 		if childKey > rc.hi {
 			rc.stack = rc.stack[:len(rc.stack)-1]
+			continue
+		}
+		if isLeafID(cid) {
+			if childKey > rc.lo && childKey <= rc.hi {
+				lf := rc.t.atLeaf(cid & idMask)
+				return Object{Key: childKey, Size: lf.size(), Class: lf.class()}, true
+			}
 			continue
 		}
 		if childKey < rc.lo && !strings.HasPrefix(rc.lo, childKey) {
@@ -736,4 +1011,198 @@ func (rc *rangeCursor) Next() (Object, bool) {
 		rc.stack = append(rc.stack, cursorFrame{id: cid, prefix: childKey})
 	}
 	return Object{}, false
+}
+
+// TreeStats is a memory-accounting snapshot of the tree's in-arena state.
+// All counters are derived by a single linear walk over the chunked arena;
+// no allocations beyond the freelist copy.
+//
+// EstHeap* fields are best-effort: edge / children-slice / agg-bytes sizes
+// are rounded up to the nearest Go small-object size class so the totals
+// reflect what the allocator actually charged, not the raw byte count.
+type TreeStats struct {
+	AliveNodes        int64
+	AliveInternals    int64 // count from the internal arena
+	AliveLeaves       int64 // count from the leaf arena
+	Leaves            int64 // alias of AliveLeaves (kept for output compatibility)
+	Internals         int64 // internals with children, no dir-marker file
+	InternalsWithFile int64 // internals carrying an S3 dir-marker file
+	Empty             int64 // root or detached internals with no children and no file
+
+	NodesWithAgg     int64
+	ClassBytePtrs    int64 // == count of nodes with file != nil (each is one *ClassByte heap alloc)
+	ClassBytesLen    int64 // sum of len(agg.Bytes)
+	ClassBytesCap    int64 // sum of cap(agg.Bytes)
+	EdgeBytes        int64 // sum of len(edge)
+	ChildrenSlots    int64 // sum of cap(children)
+	MaxEdgeLen       int
+	MaxChildrenCount int
+
+	EdgeLenHist  [9]int64 // 0,1,2,3-4,5-8,9-16,17-32,33-64,65+
+	ChildrenHist [9]int64 // 0,1,2,3,4,5-7,8-15,16-31,32+
+
+	EstHeapInternals  int64 // AliveInternals * sizeof(internal)
+	EstHeapLeaves     int64 // AliveLeaves * sizeof(leaf)
+	EstHeapNodes      int64 // EstHeapInternals + EstHeapLeaves
+	EstHeapEdges      int64 // sum over edges of sizeClass(len(edge))
+	EstHeapChildren   int64 // sum over internals of sizeClass(cap(children)*4)
+	EstHeapClassBytes int64 // ClassBytePtrs * sizeClass(sizeof(ClassByte))
+	EstHeapAggHeaders int64 // NodesWithAgg * sizeClass(sizeof(Aggregate))
+	EstHeapAggBytes   int64 // sum over aggs of sizeClass(cap(Bytes)*sizeof(ClassByte))
+	EstHeapTotal      int64
+}
+
+// Stats returns a TreeStats over every alive arena slot.
+func (t *Tree) Stats() TreeStats {
+	var s TreeStats
+	internalSize := int(unsafe.Sizeof(internal{}))
+	leafSize := int(unsafe.Sizeof(leaf{}))
+	classByteSize := int(unsafe.Sizeof(ClassByte{}))
+	aggSize := int(unsafe.Sizeof(Aggregate{}))
+
+	// Internal arena walk.
+	sortedFreeInt := append([]uint32(nil), t.freeInt...)
+	slices.Sort(sortedFreeInt)
+	fi := 0
+	for id := uint32(0); id < t.nextInt; id++ {
+		if fi < len(sortedFreeInt) && sortedFreeInt[fi] == id {
+			fi++
+			continue
+		}
+		n := t.atInternal(id)
+		s.AliveNodes++
+		s.AliveInternals++
+
+		hasFile := n.file != nil
+		nc := len(n.children)
+		switch {
+		case hasFile && nc > 0:
+			s.InternalsWithFile++
+		case !hasFile && nc > 0:
+			s.Internals++
+		default:
+			s.Empty++ // pure internals with no children (root in empty tree etc.)
+		}
+		if hasFile {
+			s.ClassBytePtrs++
+		}
+		if n.agg != nil {
+			s.NodesWithAgg++
+			s.ClassBytesLen += int64(len(n.agg.Bytes))
+			s.ClassBytesCap += int64(cap(n.agg.Bytes))
+			s.EstHeapAggBytes += int64(sizeClass(cap(n.agg.Bytes) * classByteSize))
+		}
+		el := len(n.edge)
+		s.EdgeBytes += int64(el)
+		s.EstHeapEdges += int64(sizeClass(el))
+		if el > s.MaxEdgeLen {
+			s.MaxEdgeLen = el
+		}
+		s.EdgeLenHist[edgeLenBucket(el)]++
+
+		cc := cap(n.children)
+		s.ChildrenSlots += int64(cc)
+		s.EstHeapChildren += int64(sizeClass(cc * 4))
+		if nc > s.MaxChildrenCount {
+			s.MaxChildrenCount = nc
+		}
+		s.ChildrenHist[childrenBucket(nc)]++
+	}
+
+	// Leaf arena walk.
+	sortedFreeLeaf := append([]uint32(nil), t.freeLeaf...)
+	slices.Sort(sortedFreeLeaf)
+	fl := 0
+	for id := uint32(0); id < t.nextLeaf; id++ {
+		if fl < len(sortedFreeLeaf) && sortedFreeLeaf[fl] == id {
+			fl++
+			continue
+		}
+		l := t.atLeaf(id)
+		s.AliveNodes++
+		s.AliveLeaves++
+		s.Leaves++
+
+		el := len(l.edge)
+		s.EdgeBytes += int64(el)
+		s.EstHeapEdges += int64(sizeClass(el))
+		if el > s.MaxEdgeLen {
+			s.MaxEdgeLen = el
+		}
+		s.EdgeLenHist[edgeLenBucket(el)]++
+		s.ChildrenHist[0]++ // leaves have no children
+	}
+
+	s.EstHeapInternals = s.AliveInternals * int64(internalSize)
+	s.EstHeapLeaves = s.AliveLeaves * int64(leafSize)
+	s.EstHeapNodes = s.EstHeapInternals + s.EstHeapLeaves
+	s.EstHeapClassBytes = s.ClassBytePtrs * int64(sizeClass(classByteSize))
+	s.EstHeapAggHeaders = s.NodesWithAgg * int64(sizeClass(aggSize))
+	s.EstHeapTotal = s.EstHeapNodes + s.EstHeapEdges + s.EstHeapChildren +
+		s.EstHeapClassBytes + s.EstHeapAggHeaders + s.EstHeapAggBytes
+	return s
+}
+
+// sizeClass approximates the Go runtime's small-object size classes. The
+// allocator rounds requests up to the nearest size class, so a 10-byte
+// string actually occupies 16 bytes of heap. Beyond the table we round to
+// the next power of two.
+func sizeClass(n int) int {
+	if n == 0 {
+		return 0
+	}
+	classes := [...]int{8, 16, 24, 32, 48, 64, 80, 96, 112, 128, 144, 160, 176, 192, 208, 224, 240, 256, 288, 320, 352, 384, 416, 448, 480, 512}
+	for _, c := range classes {
+		if n <= c {
+			return c
+		}
+	}
+	// beyond 512 B: round up to nearest 64 B.
+	return (n + 63) &^ 63
+}
+
+func edgeLenBucket(n int) int {
+	switch {
+	case n == 0:
+		return 0
+	case n == 1:
+		return 1
+	case n == 2:
+		return 2
+	case n <= 4:
+		return 3
+	case n <= 8:
+		return 4
+	case n <= 16:
+		return 5
+	case n <= 32:
+		return 6
+	case n <= 64:
+		return 7
+	default:
+		return 8
+	}
+}
+
+func childrenBucket(n int) int {
+	switch {
+	case n == 0:
+		return 0
+	case n == 1:
+		return 1
+	case n == 2:
+		return 2
+	case n == 3:
+		return 3
+	case n == 4:
+		return 4
+	case n <= 7:
+		return 5
+	case n <= 15:
+		return 6
+	case n <= 31:
+		return 7
+	default:
+		return 8
+	}
 }
