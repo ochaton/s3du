@@ -8,10 +8,13 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"io"
 	"log/slog"
 	"os"
 	"os/signal"
 	"path/filepath"
+	"runtime"
+	"runtime/pprof"
 	"sync"
 	"syscall"
 	"time"
@@ -20,6 +23,7 @@ import (
 	"github.com/aws/aws-sdk-go-v2/aws/retry"
 	"github.com/aws/aws-sdk-go-v2/config"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
+	smithylogging "github.com/aws/smithy-go/logging"
 
 	"github.com/ochaton/s3du/radix"
 )
@@ -36,6 +40,7 @@ type opts struct {
 	workers       int
 	maxDepth      int
 	snapshotPath  string
+	logPath       string
 	loadOnly      bool
 	interactive   bool
 	debug         bool
@@ -55,12 +60,21 @@ func main() {
 	flag.StringVar(&o.snapshotPath, "snapshot", "", "path to write/read the binary tree snapshot (defaults to ~/.cache/s3du/<bucket>@<region>/tree.snap)")
 	flag.BoolVar(&o.loadOnly, "load", false, "skip scanning, load the snapshot from -snapshot and continue (e.g., launch TUI)")
 	flag.BoolVar(&o.interactive, "i", false, "launch the bubbletea TUI after the scan finishes")
-	flag.BoolVar(&o.debug, "debug", false, "verbose structured logging to stderr; disables the live progress dashboard")
+	flag.BoolVar(&o.debug, "debug", false, "mirror the structured log to stderr (disables the live progress dashboard); file logging happens regardless")
+	flag.StringVar(&o.logPath, "log", "", "structured-log file path (default: <cache>/s3du/<bucket>/scan.log)")
 	flag.BoolVar(&o.stats, "stats", false, "after acquiring the tree, print arena/memory statistics and exit (skips TUI and listing)")
 	flag.BoolVar(&o.debugTree, "debug-tree", false, "launch the radix-internals TUI (raw nodes, edges, CIDs) instead of the directory browser; implies -i")
 	flag.Parse()
 	o.progressEvery = time.Duration(*progressMs) * time.Millisecond
-	configureLogging(o.debug)
+	logFile, err := configureLogging(o.debug, o.logPath, o.bucket, o.region)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "s3du: log setup:", err)
+		os.Exit(1)
+	}
+	if logFile != nil {
+		defer logFile.Close()
+	}
+	installGoroutineDumper(o.bucket, o.region)
 
 	if err := run(o); err != nil {
 		fmt.Fprintln(os.Stderr, "s3du:", err)
@@ -210,15 +224,71 @@ func printRootListing(tree *radix.Tree, region string) error {
 	return nil
 }
 
-// configureLogging installs slog's default logger writing to stderr at
-// Info level (Debug when -debug is set). The scanner's hot-path log calls
-// are at Debug, so they stay silent unless -debug is requested.
-func configureLogging(debug bool) {
-	level := slog.LevelInfo
-	if debug {
-		level = slog.LevelDebug
+// configureLogging installs slog's default logger and returns the (possibly
+// nil) opened log file so main can close it on exit.
+//
+// File logging is on by default at Debug level; the file lives at the path
+// supplied via -log or, when empty, at <cache>/s3du/<bucket>/scan.log so
+// the dashboard's progress display stays uncluttered while a complete
+// audit trail is captured on disk.
+//
+// When -debug is also set, the logger writes to BOTH the file AND stderr,
+// matching the legacy behaviour of mixing structured logs with the run.
+// When the bucket is empty (e.g. `-load`-only mode without a scan), file
+// logging is skipped — there's nothing useful to record.
+func configureLogging(debug bool, logPath, bucket, region string) (*os.File, error) {
+	level := slog.LevelDebug
+
+	var writers []io.Writer
+	var file *os.File
+
+	if path := resolveLogPath(logPath, bucket, region); path != "" {
+		if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+			return nil, fmt.Errorf("create log dir %q: %w", filepath.Dir(path), err)
+		}
+		f, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o644)
+		if err != nil {
+			return nil, fmt.Errorf("open log %q: %w", path, err)
+		}
+		file = f
+		writers = append(writers, f)
 	}
-	slog.SetDefault(slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: level})))
+	if debug || len(writers) == 0 {
+		writers = append(writers, os.Stderr)
+	}
+
+	var out io.Writer
+	if len(writers) == 1 {
+		out = writers[0]
+	} else {
+		out = io.MultiWriter(writers...)
+	}
+
+	slog.SetDefault(slog.New(slog.NewTextHandler(out, &slog.HandlerOptions{Level: level})))
+	if file != nil {
+		slog.Info("logging to file", "path", file.Name())
+	}
+	return file, nil
+}
+
+// resolveLogPath returns the file the structured log should be written to,
+// or "" to skip file logging. Precedence: explicit -log flag → derived from
+// bucket/region → nothing.
+func resolveLogPath(explicit, bucket, region string) string {
+	if explicit != "" {
+		return explicit
+	}
+	if bucket == "" {
+		return ""
+	}
+	dir, err := os.UserCacheDir()
+	if err != nil {
+		return ""
+	}
+	if region == "" {
+		region = "unknown"
+	}
+	return filepath.Join(dir, "s3du", bucket+"@"+region, "scan.log")
 }
 
 // defaultSnapshotPath returns ~/.cache/s3du/<bucket>@<region>/tree.snap.
@@ -244,6 +314,10 @@ func newS3Client(ctx context.Context, region, endpoint string) (*s3.Client, erro
 					})
 			})
 		}),
+		// Surface SDK warnings (retries, throttling decisions) through slog
+		// so the operator can see what the retryer is doing under load.
+		config.WithClientLogMode(aws.LogRetries),
+		config.WithLogger(slogAWSLogger{}),
 	}
 	if region != "" {
 		loaders = append(loaders, config.WithRegion(region))
@@ -258,5 +332,61 @@ func newS3Client(ctx context.Context, region, endpoint string) (*s3.Client, erro
 			opt.UsePathStyle = true
 		}
 	}), nil
+}
+
+// slogAWSLogger adapts the smithy-go logger interface onto slog. Warn-class
+// messages (retries, throttling) hit slog.Warn so they show up even at the
+// default Info level; debug-class messages go to slog.Debug.
+type slogAWSLogger struct{}
+
+func (slogAWSLogger) Logf(classification smithylogging.Classification, format string, args ...any) {
+	msg := fmt.Sprintf(format, args...)
+	switch classification {
+	case smithylogging.Warn:
+		slog.Warn(msg, "src", "aws")
+	case smithylogging.Debug:
+		slog.Debug(msg, "src", "aws")
+	default:
+		slog.Info(msg, "src", "aws")
+	}
+}
+
+// installGoroutineDumper wires SIGUSR1 to a handler that writes the current
+// goroutine dump to a file in the user's cache dir. Useful for diagnosing a
+// scan that has gone quiet without killing the process — workers stuck in
+// retry backoff vs deadlocked vs all exited each look distinct.
+func installGoroutineDumper(bucket, region string) {
+	ch := make(chan os.Signal, 1)
+	signal.Notify(ch, syscall.SIGUSR1)
+	go func() {
+		for range ch {
+			path := goroutineDumpPath(bucket, region)
+			if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+				slog.Error("goroutine dump: mkdir", "err", err, "path", path)
+				continue
+			}
+			f, err := os.Create(path)
+			if err != nil {
+				slog.Error("goroutine dump: create", "err", err, "path", path)
+				continue
+			}
+			if err := pprof.Lookup("goroutine").WriteTo(f, 2); err != nil {
+				slog.Error("goroutine dump: write", "err", err, "path", path)
+			}
+			_ = f.Close()
+			slog.Warn("goroutine dump written",
+				"path", path,
+				"numGoroutine", runtime.NumGoroutine())
+		}
+	}()
+}
+
+func goroutineDumpPath(bucket, region string) string {
+	dir, _ := os.UserCacheDir()
+	if region == "" {
+		region = "unknown"
+	}
+	ts := time.Now().Format("20060102-150405")
+	return filepath.Join(dir, "s3du", bucket+"@"+region, "goroutine-"+ts+".txt")
 }
 
