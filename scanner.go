@@ -169,11 +169,12 @@ func (s *Scanner) discover(ctx context.Context, workQ chan<- string, batchQ chan
 	// lower bound for radix.Batch's exclusive StartFrom contract.
 	prevKey := prefix
 	for p.HasMorePages() {
+		start := s.progress.beginRequest()
 		page, err := p.NextPage(ctx)
+		s.progress.endRequest(start)
 		if err != nil {
 			return err
 		}
-		s.progress.observeList()
 
 		if len(page.Contents) > 0 {
 			batch := makeBatch(prevKey, page.Contents)
@@ -207,11 +208,12 @@ func (s *Scanner) listRecursive(ctx context.Context, batchQ chan<- radix.Batch, 
 	})
 	prevKey := prefix
 	for p.HasMorePages() {
+		start := s.progress.beginRequest()
 		page, err := p.NextPage(ctx)
+		s.progress.endRequest(start)
 		if err != nil {
 			return err
 		}
-		s.progress.observeList()
 		if len(page.Contents) == 0 {
 			continue
 		}

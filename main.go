@@ -113,7 +113,7 @@ func acquireTree(ctx context.Context, o *opts) (*radix.Tree, error) {
 	}
 
 	tree := radix.New()
-	prog := NewProgress(o.region)
+	prog := NewProgress(o.region, o.workers)
 
 	// Reporter is joined via WaitGroup so its final progress line is fully
 	// flushed before the next stderr write — replaces the previous
@@ -133,7 +133,15 @@ func acquireTree(ctx context.Context, o *opts) (*radix.Tree, error) {
 	if scanErr != nil {
 		return nil, scanErr
 	}
-	fmt.Fprintf(os.Stderr, "scan completed in %s\n", time.Since(start))
+	final := prog.Snapshot()
+	fmt.Fprintf(os.Stderr,
+		"scan completed in %s · eff parallelism: avg %.1f/%d (%d%%), final %.1f/%d (%d%%)\n",
+		time.Since(start),
+		final.CumulativeParallelism(), final.MaxWorkers,
+		int(final.CumulativeParallelism()*100/float64(max(final.MaxWorkers, 1))),
+		final.InflightEWMA, final.MaxWorkers,
+		int(final.InflightEWMA*100/float64(max(final.MaxWorkers, 1))),
+	)
 
 	if err := saveSnapshot(o.snapshotPath, tree); err != nil {
 		return nil, fmt.Errorf("save snapshot %s: %w", o.snapshotPath, err)
