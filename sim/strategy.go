@@ -85,12 +85,29 @@ func (r Result) WorkerLoadStats() (minReqs, maxReqs int64, stddev float64) {
 	return minReqs, maxReqs, stddev
 }
 
-// String renders a compact summary line for terminal output.
+// MaxPerWorker returns the largest per-worker request count. Under real
+// S3 latency this is the critical-path proxy — the strategy can be no
+// faster than max-per-worker × per-request latency, no matter how many
+// workers exist.
+func (r Result) MaxPerWorker() int64 {
+	var m int64
+	for _, n := range r.PerWorker {
+		if n > m {
+			m = n
+		}
+	}
+	return m
+}
+
+// String renders one cost/speed line. Wall-clock is omitted — sim wall
+// time is meaningless (latency=0 default; real S3 round-trips dominate).
+// The two interpretable axes are total requests (= cost in USD) and
+// max-per-worker (= critical path under any real latency model).
 func (r Result) String() string {
 	var b strings.Builder
-	fmt.Fprintf(&b, "%-30s w=%2d reqs=%-7d contents=%-9d cp=%-7d elapsed=%-9s obj/req=%-6.1f reqs/s=%-7.0f",
-		r.StrategyName, r.Workers, r.Requests, r.ContentsCount, r.CommonPrefixes,
-		r.Elapsed.Round(time.Millisecond), r.AvgPerReq(), r.ReqsPerSec())
+	maxW := r.MaxPerWorker()
+	fmt.Fprintf(&b, "%-30s w=%2d reqs=%-9d max/worker=%-7d obj/req=%-6.1f contents=%-9d cp=%-9d",
+		r.StrategyName, r.Workers, r.Requests, maxW, r.AvgPerReq(), r.ContentsCount, r.CommonPrefixes)
 	if len(r.PerWorker) > 1 {
 		minN, maxN, _ := r.WorkerLoadStats()
 		balance := 0.0
