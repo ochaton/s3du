@@ -47,7 +47,16 @@ type Progress struct {
 	// reads via math.Float64frombits — no torn reads thanks to the 8-byte
 	// atomic.
 	inflightEWMAbits atomic.Uint64
+
+	// objectsPerSecBits / requestsPerSecBits hold EWMAs of the per-second
+	// rates of objectsSeen and listRequests, sampled in lockstep with
+	// inflight. Same float64-in-uint64 trick.
+	objectsPerSecBits  atomic.Uint64
+	requestsPerSecBits atomic.Uint64
+
 	lastSampleAt    atomic.Int64 // unix-nano of the previous EWMA sample
+	lastObjectsSeen atomic.Int64
+	lastListRequests atomic.Int64
 
 	// One bucket per StorageClass enum value plus headroom. Indexed by the
 	// uint8 value of radix.StorageClass.
@@ -100,9 +109,10 @@ func (p *Progress) observeBatch(objs []radix.Object) {
 	}
 }
 
-// sampleInflight pulls the current inflight value and folds it into the
-// EWMA. It must be called from a single goroutine (the reporter) — the
-// EWMA's writer-side has no locking. The formula handles variable dt:
+// sampleInflight folds three measurements into their EWMAs in one pass:
+// the instantaneous inflight count, and the per-second rates of new
+// objects and list requests observed since the last sample. Must be called
+// from a single goroutine (the reporter); the writer side is lock-free.
 //
 //	alpha = 1 - exp(-dt / tau)
 //	ewma += alpha * (sample - ewma)
@@ -117,12 +127,26 @@ func (p *Progress) sampleInflight() {
 		return
 	}
 	p.lastSampleAt.Store(now.UnixNano())
-
-	sample := float64(p.inflight.Load())
-	prev := math.Float64frombits(p.inflightEWMAbits.Load())
 	alpha := 1 - math.Exp(-float64(dt)/float64(ewmaTau))
-	next := prev + alpha*(sample-prev)
-	p.inflightEWMAbits.Store(math.Float64bits(next))
+
+	// Inflight gauge: sample is the current count.
+	inflight := float64(p.inflight.Load())
+	prev := math.Float64frombits(p.inflightEWMAbits.Load())
+	p.inflightEWMAbits.Store(math.Float64bits(prev + alpha*(inflight-prev)))
+
+	// Object rate: delta over the elapsed sample window converted to /s.
+	objs := p.objectsSeen.Load()
+	dObjs := objs - p.lastObjectsSeen.Swap(objs)
+	objRate := float64(dObjs) / dt.Seconds()
+	prevR := math.Float64frombits(p.objectsPerSecBits.Load())
+	p.objectsPerSecBits.Store(math.Float64bits(prevR + alpha*(objRate-prevR)))
+
+	// Request rate.
+	reqs := p.listRequests.Load()
+	dReqs := reqs - p.lastListRequests.Swap(reqs)
+	reqRate := float64(dReqs) / dt.Seconds()
+	prevQ := math.Float64frombits(p.requestsPerSecBits.Load())
+	p.requestsPerSecBits.Store(math.Float64bits(prevQ + alpha*(reqRate-prevQ)))
 }
 
 // ProgressSnapshot is a point-in-time copy of the counters, safe to format
@@ -135,6 +159,8 @@ type ProgressSnapshot struct {
 	ObjectsSeen       int64
 	Inflight          int64
 	InflightEWMA      float64
+	ObjectsPerSec     float64
+	RequestsPerSec    float64
 	TotalRequestNanos int64
 	BytesByClass      [numStorageClasses]int64
 	ObjectsByClass    [numStorageClasses]int64
@@ -151,6 +177,8 @@ func (p *Progress) Snapshot() ProgressSnapshot {
 		ObjectsSeen:       p.objectsSeen.Load(),
 		Inflight:          p.inflight.Load(),
 		InflightEWMA:      math.Float64frombits(p.inflightEWMAbits.Load()),
+		ObjectsPerSec:     math.Float64frombits(p.objectsPerSecBits.Load()),
+		RequestsPerSec:    math.Float64frombits(p.requestsPerSecBits.Load()),
 		TotalRequestNanos: p.totalRequestNanos.Load(),
 	}
 	for i := range s.BytesByClass {
@@ -227,4 +255,19 @@ func humanDollars(d float64) string {
 		return fmt.Sprintf("$%.4f", d)
 	}
 	return fmt.Sprintf("$%.2f", d)
+}
+
+// humanRate formats a per-second rate with K/M/G suffixes. Falls back to a
+// plain integer with no suffix below 1000.
+func humanRate(r float64) string {
+	switch {
+	case r >= 1e9:
+		return fmt.Sprintf("%.1fG/s", r/1e9)
+	case r >= 1e6:
+		return fmt.Sprintf("%.1fM/s", r/1e6)
+	case r >= 1e3:
+		return fmt.Sprintf("%.1fK/s", r/1e3)
+	default:
+		return fmt.Sprintf("%.0f/s", r)
+	}
 }
