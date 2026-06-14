@@ -13,9 +13,9 @@ without re-paying the list cost.
 go install github.com/ochaton/s3du@latest
 
 # Side binaries
-go install github.com/ochaton/s3du/cmd/s3du-rm@latest      # parallel batched delete
-go install github.com/ochaton/s3du/cmd/s3du-export@latest  # snapshot → JSONL
-go install github.com/ochaton/s3du/cmd/s3du-sim@latest     # offline strategy A/B
+go install github.com/ochaton/s3du/cmd/s3du-rm@latest    # parallel batched delete by prefix
+go install github.com/ochaton/s3du/cmd/s3du-sim@latest   # offline strategy A/B against a snapshot
+go install github.com/ochaton/s3du/cmd/radix-bench@latest # microbench for the radix tree
 ```
 
 Or build from source:
@@ -31,8 +31,8 @@ go build -o s3du .
 # Scan a bucket and drop into the TUI
 s3du -bucket my-bucket -i
 
-# Re-open the snapshot without re-scanning
-s3du -snapshot ~/.cache/s3du/my-bucket@eu-central-1/tree.snap -load -i
+# Re-open the snapshot without re-scanning (default path resolved automatically)
+s3du -bucket my-bucket -load -i
 
 # Snapshot + print stats only
 s3du -snapshot path -load -stats
@@ -45,12 +45,14 @@ AWS credentials come from the env/profile chain (`AWS_PROFILE`,
 `~/.aws/credentials`, IAM role, etc). The bucket's region is auto-detected
 via HeadBucket when `-region` is left blank.
 
-## Cache
+## Snapshot
 
-Each scan writes a binary snapshot:
+Each scan writes a binary snapshot under the platform's user-cache dir
+(`os.UserCacheDir`):
 
 ```
-~/.cache/s3du/<bucket>@<region>/tree.snap
+Linux : ~/.cache/s3du/<bucket>@<region>/tree.snap
+macOS : ~/Library/Caches/s3du/<bucket>@<region>/tree.snap
 ```
 
 Re-open with `-load -snapshot <path>` — no re-scan, full TUI / -stats / -i
