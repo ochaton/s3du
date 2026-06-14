@@ -51,14 +51,26 @@ type opts struct {
 	progressEvery time.Duration
 }
 
+// defaultWorkers picks a worker count of NumCPU × 2. ListObjectsV2 is
+// almost entirely network-bound (~150 ms round-trip), so wanting more
+// inflight requests than CPUs is correct; the 2× heuristic gives us
+// headroom on small instances without paying for a hand-tuned constant.
+func defaultWorkers() int {
+	n := runtime.NumCPU() * 2
+	if n < 4 {
+		return 4
+	}
+	return n
+}
+
 func main() {
 	var o opts
 	progressMs := flag.Int("progress-ms", 250, "progress reporter interval in milliseconds")
 	flag.StringVar(&o.bucket, "bucket", "", "S3 bucket to scan (required unless -load is set)")
 	flag.StringVar(&o.region, "region", "", "AWS region (auto-detected when empty)")
 	flag.StringVar(&o.endpoint, "endpoint", "", "non-AWS S3 endpoint URL (uses path-style addressing)")
-	flag.IntVar(&o.workers, "workers", 32, "number of concurrent ListObjectsV2 workers")
-	flag.IntVar(&o.maxDepth, "max-depth", 8, "cap on delimiter-probe depth; beyond this the worker switches to a paginated recursive scan")
+	flag.IntVar(&o.workers, "workers", defaultWorkers(), "number of concurrent ListObjectsV2 workers (defaults to NumCPU × 2)")
+	flag.IntVar(&o.maxDepth, "max-depth", 3, "cap on delimiter-probe depth; beyond this the worker switches to a paginated recursive scan")
 	flag.StringVar(&o.snapshotPath, "snapshot", "", "path to write/read the binary tree snapshot (defaults to ~/.cache/s3du/<bucket>@<region>/tree.snap)")
 	flag.BoolVar(&o.loadOnly, "load", false, "skip scanning, load the snapshot from -snapshot and continue (e.g., launch TUI)")
 	flag.BoolVar(&o.interactive, "i", false, "launch the bubbletea TUI after the scan finishes")

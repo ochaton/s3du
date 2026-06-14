@@ -48,6 +48,8 @@ Measured on a 50M-object bucket: **174 → 101 B/object** in memory,
   worker pulls `(prefix, depth)` items, probes with `/` delimiter,
   fans out CommonPrefixes into the queue. Self-balancing across
   uneven branching factors.
+- **Defaults**: `-workers` is `runtime.NumCPU() × 2` (clamped to ≥4),
+  `-max-depth` is `3`. Both overridable on the CLI.
 - **Inline-fallback on full queue** prevents producer-consumer
   deadlock when fan-out is faster than consumption.
 - **HeadBucket-based region auto-discovery** — `-region` is optional.
