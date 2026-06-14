@@ -410,8 +410,15 @@ func (t *Tree) insertFromPath(path []framePath, obj Object) []framePath {
 			// No sibling shares the next byte — attach the remainder of
 			// the key as a brand-new leaf. The leaf's own aggregate is
 			// derived on demand from its file (effectiveAgg).
+			//
+			// strings.Clone is critical here (and at every other edge
+			// assignment in this function): without it the edge would be
+			// a slice header pointing into the caller's batch key string,
+			// keeping the whole multi-hundred-byte source string alive
+			// for the lifetime of the tree. At ten-of-millions-of-objects
+			// scale that retention dwarfs the radix nodes themselves.
 			leafID := t.alloc(node{
-				edge: key,
+				edge: strings.Clone(key),
 				file: &ClassByte{Class: obj.Class, Size: obj.Size},
 			})
 			n.children = insertChildAt(n.children, idx, leafID)
@@ -435,7 +442,9 @@ func (t *Tree) insertFromPath(path []framePath, obj Object) []framePath {
 		// child.edge and key diverge after lcp bytes. Build an intermediate
 		// node carrying the shared prefix, shrink child to its remainder,
 		// and place obj either at the intermediate itself (if its key ends
-		// exactly at lcp) or as a brand-new sibling leaf.
+		// exactly at lcp) or as a brand-new sibling leaf. child.edge is
+		// already owned (was cloned on its own insert) — slicing it stays
+		// on its private backing.
 		intAgg := t.aggForSplit(childID, obj)
 		intID := t.alloc(node{edge: child.edge[:lcp], agg: intAgg})
 		child.edge = child.edge[lcp:]
@@ -449,7 +458,7 @@ func (t *Tree) insertFromPath(path []framePath, obj Object) []framePath {
 		}
 
 		leafID := t.alloc(node{
-			edge: key[lcp:],
+			edge: strings.Clone(key[lcp:]),
 			file: &ClassByte{Class: obj.Class, Size: obj.Size},
 		})
 		t.at(intID).children = t.sortChildren(childID, leafID)
