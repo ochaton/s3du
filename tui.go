@@ -50,7 +50,7 @@ type tuiModel struct {
 	stack      []navFrame    // ancestry from root to prefix exclusive
 	entries    []radix.Entry // listing of prefix; recomputed on navigation
 	cursor     int           // selected entry index
-	maxBytes   int64         // largest single-entry byte count in this listing — drives the percent bar
+	totalBytes int64         // sum of byte counts in this listing — denominator for the percent bar
 	err        error         // last navigation error, if any
 	sortMode   sortMode      // current sort column
 	sortAsc    bool          // false = descending (default for size/objects), true = ascending
@@ -86,29 +86,27 @@ func (m *tuiModel) reload() {
 	if err != nil {
 		m.err = err
 		m.entries = nil
-		m.maxBytes = 0
+		m.totalBytes = 0
 		return
 	}
 	m.err = nil
 	m.entries = entries
 	m.sortEntries()
-	m.recomputeMaxBytes()
+	m.recomputeTotalBytes()
 	if m.cursor >= len(entries) {
 		m.cursor = max(0, len(entries)-1)
 	}
 }
 
-// recomputeMaxBytes updates the cached maximum byte count over the current
-// listing — used to scale the percentage bar in renderRow.
-func (m *tuiModel) recomputeMaxBytes() {
-	var max int64
+// recomputeTotalBytes updates the cached total byte count over the
+// current listing — used as the denominator for the percentage bar, so
+// the values for the row sum to 100%.
+func (m *tuiModel) recomputeTotalBytes() {
+	var sum int64
 	for _, e := range m.entries {
-		b := entryBytes(e)
-		if b > max {
-			max = b
-		}
+		sum += entryBytes(e)
 	}
-	m.maxBytes = max
+	m.totalBytes = sum
 }
 
 // sortEntries orders m.entries by the active sortMode (and direction),
@@ -549,17 +547,18 @@ func (m *tuiModel) visualWidth() int {
 }
 
 // renderVisual draws the per-row size widget according to the current
-// barMode. value/m.maxBytes gives the proportion.
+// barMode. value/m.totalBytes gives the proportion — entries across the
+// listing sum to 100%.
 func (m *tuiModel) renderVisual(value int64) string {
 	switch m.barMode {
 	case barOff:
 		return ""
 	case barOnly:
-		return renderBar(value, m.maxBytes, percentBarWidth)
+		return renderBar(value, m.totalBytes, percentBarWidth)
 	case barAndPct:
-		return renderBar(value, m.maxBytes, percentBarWidth) + " " + renderPct(value, m.maxBytes)
+		return renderBar(value, m.totalBytes, percentBarWidth) + " " + renderPct(value, m.totalBytes)
 	case barPctOnly:
-		return renderPct(value, m.maxBytes)
+		return renderPct(value, m.totalBytes)
 	}
 	return ""
 }
