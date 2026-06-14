@@ -20,10 +20,13 @@ import (
 // avoid one *string allocation per paginator init.
 var slashStr = aws.String("/")
 
-// workQueueCapacity bounds the in-flight queue. Sized for worst-case fan-out:
-// the deepest layer can briefly hold every just-discovered sub-prefix. At
-// 32 workers and ~10³ branching factor per probe, 64 K is comfortable.
-const workQueueCapacity = 65536
+// workQueueSlotsPerWorker is the per-worker share of the shared queue buffer.
+// Total capacity = workers × this constant. With the inline-fallback path
+// (tryEnqueue → process-inline when full) absorbing any overflow, the queue
+// only needs enough slack for normal worker hand-off, not exponential
+// fan-out. Small buffer keeps producers landing on inline recursion sooner,
+// improving cache locality and bounding worst-case in-flight memory.
+const workQueueSlotsPerWorker = 4
 
 // Scanner walks an S3 bucket and ingests every object into a radix.Tree.
 //
@@ -96,7 +99,8 @@ func (s *Scanner) Run(ctx context.Context) error {
 	ctx, s.cancel = context.WithCancel(ctx)
 	defer s.cancel()
 
-	workQ := make(chan workItem, workQueueCapacity)
+	workQ := make(chan workItem, s.workers*workQueueSlotsPerWorker)
+	s.progress.SetQueueDepthFn(func() int { return len(workQ) })
 	batchQ := make(chan radix.Batch, 256)
 	done := make(chan struct{})
 

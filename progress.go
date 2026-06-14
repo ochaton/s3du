@@ -62,6 +62,19 @@ type Progress struct {
 	// uint8 value of radix.StorageClass.
 	bytesByClass   [numStorageClasses]atomic.Int64
 	objectsByClass [numStorageClasses]atomic.Int64
+
+	// queueDepthFn returns the current length of the scanner's work queue.
+	// Set by the scanner after construction; left nil when no scanner is
+	// running (e.g. -load mode), in which case Snapshot reports 0.
+	// Wrapped in atomic.Pointer so reader (TUI sample goroutine) and writer
+	// (scanner) coordinate without a mutex.
+	queueDepthFn atomic.Pointer[func() int]
+}
+
+// SetQueueDepthFn registers a callback returning the current length of the
+// scanner's work queue. The callback is invoked at every Snapshot.
+func (p *Progress) SetQueueDepthFn(f func() int) {
+	p.queueDepthFn.Store(&f)
 }
 
 // NewProgress returns a zero-state Progress tracking storage in the given
@@ -162,6 +175,7 @@ type ProgressSnapshot struct {
 	ObjectsPerSec     float64
 	RequestsPerSec    float64
 	TotalRequestNanos int64
+	QueueDepth        int // current length of the scanner's work queue
 	BytesByClass      [numStorageClasses]int64
 	ObjectsByClass    [numStorageClasses]int64
 }
@@ -180,6 +194,9 @@ func (p *Progress) Snapshot() ProgressSnapshot {
 		ObjectsPerSec:     math.Float64frombits(p.objectsPerSecBits.Load()),
 		RequestsPerSec:    math.Float64frombits(p.requestsPerSecBits.Load()),
 		TotalRequestNanos: p.totalRequestNanos.Load(),
+	}
+	if fnp := p.queueDepthFn.Load(); fnp != nil {
+		s.QueueDepth = (*fnp)()
 	}
 	for i := range s.BytesByClass {
 		s.BytesByClass[i] = p.bytesByClass[i].Load()

@@ -89,10 +89,11 @@ func printPlain(w io.Writer, s ProgressSnapshot, final bool) {
 		end = "\n"
 	}
 	fmt.Fprintf(w,
-		"lists=%-7d (%-8s) inflight=%2d/%-2d (%3d%%) eff=%5.1f/%-2d (%3d%%) objects=%-9d (%-9s) bytes=%-9s list$=%-7s storage$/mo=%-7s%s",
+		"lists=%-7d (%-8s) inflight=%2d/%-2d (%3d%%) eff=%5.1f/%-2d (%3d%%) queue=%-5d objects=%-9d (%-9s) bytes=%-9s list$=%-7s storage$/mo=%-7s%s",
 		s.ListRequests, humanRate(s.RequestsPerSec),
 		s.Inflight, s.MaxWorkers, percent(float64(s.Inflight), s.MaxWorkers),
 		s.InflightEWMA, s.MaxWorkers, percent(s.InflightEWMA, s.MaxWorkers),
+		s.QueueDepth,
 		s.ObjectsSeen, humanRate(s.ObjectsPerSec),
 		humanBytes(s.TotalBytes()),
 		humanDollars(s.ListCost()),
@@ -198,6 +199,7 @@ func (m progressModel) View() string {
 		header,
 		"",
 		row("lists", fmt.Sprintf("%d  (%s)", s.ListRequests, humanRate(s.RequestsPerSec))),
+		row("queue", fmt.Sprintf("%d", s.QueueDepth)),
 		row("objects", fmt.Sprintf("%d  (%s)", s.ObjectsSeen, humanRate(s.ObjectsPerSec))),
 		row("bytes", humanBytes(s.TotalBytes())),
 		row("list$", humanDollars(s.ListCost())),
