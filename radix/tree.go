@@ -1047,8 +1047,9 @@ func (t *Tree) applyDelta(path []framePath, class StorageClass, sizeDelta, objDe
 // callers so the cursor is fully drained before any mutation happens.
 type rangeCursor struct {
 	t      *Tree
-	stack  []cursorFrame
-	lo, hi string
+	stack       []cursorFrame
+	lo, hi      string
+	unboundedHi bool // when true, the hi bound is ignored — iterate to end
 }
 
 type cursorFrame struct {
@@ -1082,7 +1083,7 @@ func (rc *rangeCursor) Next() (Object, bool) {
 		n := rc.t.atInternal(top.id)
 		if !top.fileEmitted {
 			top.fileEmitted = true
-			if cb, ok := rc.t.dirMarker(top.id); ok && top.prefix > rc.lo && top.prefix <= rc.hi {
+			if cb, ok := rc.t.dirMarker(top.id); ok && top.prefix > rc.lo && (rc.unboundedHi || top.prefix <= rc.hi) {
 				return Object{Key: top.prefix, Size: cb.Size, Class: cb.Class}, true
 			}
 		}
@@ -1096,12 +1097,12 @@ func (rc *rangeCursor) Next() (Object, bool) {
 		childKey := top.prefix + childEdge
 		// All subsequent siblings have a strictly greater first byte, hence
 		// strictly greater childKey — once one exceeds hi, pop the frame.
-		if childKey > rc.hi {
+		if !rc.unboundedHi && childKey > rc.hi {
 			rc.stack = rc.stack[:len(rc.stack)-1]
 			continue
 		}
 		if isLeafID(cid) {
-			if childKey > rc.lo && childKey <= rc.hi {
+			if childKey > rc.lo && (rc.unboundedHi || childKey <= rc.hi) {
 				lf := rc.t.atLeaf(cid & idMask)
 				return Object{Key: childKey, Size: lf.size(), Class: lf.class()}, true
 			}
